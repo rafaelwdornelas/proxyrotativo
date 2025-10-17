@@ -1,3 +1,4 @@
+
 # 🚀 Proxy Rotativo Multi-Modem 4G
 
 Sistema completo de gerenciamento de múltiplos modems 4G para rotação de IP através de proxies HTTP/SOCKS5, com dashboard web e API REST.
@@ -204,6 +205,24 @@ chmod +x install.sh
 sudo bash install.sh
 
 # 4. Seguir instruções na tela
+# O script irá:
+#   - Verificar arquivos necessários
+#   - Instalar dependências
+#   - Compilar a API automaticamente
+#   - Configurar systemd services
+#   - Configurar firewall
+```
+
+### Verificação Pós-Instalação
+
+```bash
+# Verificar se tudo foi instalado corretamente
+sudo systemctl status ModemManager
+sudo systemctl status proxy-api
+mmcli -L
+
+# Ver logs em tempo real
+sudo journalctl -u proxy-api -f
 ```
 
 ### Instalação Manual
@@ -218,7 +237,7 @@ sudo apt update && sudo apt upgrade -y
 # 2. Instalar dependências
 sudo apt install -y modemmanager libqmi-utils libmbim-utils \
     usb-modeswitch build-essential golang-go git curl wget \
-    net-tools iptables ufw iptables-persistent
+    net-tools iptables ufw iptables-persistent jq
 
 # 3. Compilar 3proxy
 cd /tmp
@@ -235,18 +254,55 @@ mkdir -p ~/proxy-api
 
 # 5. Copiar arquivos
 cp proxy-manager.sh ~/proxy-system/
-cp main.go ~/proxy-api/
+cp proxy-api/main.go ~/proxy-api/
 chmod +x ~/proxy-system/proxy-manager.sh
 
 # 6. Compilar API
 cd ~/proxy-api
 go build -o proxy-api main.go
 
-# 7. Configurar systemd
-sudo cp systemd/proxy-api.service /etc/systemd/system/
-sudo cp systemd/proxy-system.service /etc/systemd/system/
+# 7. Criar services do systemd (substitua SEU_USUARIO)
+sudo tee /etc/systemd/system/proxy-api.service << 'EOF'
+[Unit]
+Description=Proxy Manager API
+After=network.target ModemManager.service
+
+[Service]
+Type=simple
+User=SEU_USUARIO
+WorkingDirectory=/home/SEU_USUARIO/proxy-api
+ExecStart=/home/SEU_USUARIO/proxy-api/proxy-api
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/proxy-system.service << 'EOF'
+[Unit]
+Description=Proxy Multi-Modem System
+After=network.target ModemManager.service
+Requires=ModemManager.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/sudo -u root /home/SEU_USUARIO/proxy-system/proxy-manager.sh start
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 sudo systemctl daemon-reload
 sudo systemctl enable proxy-api proxy-system
+
+# 8. Habilitar IP forwarding
+echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
 ```
 
 </details>
@@ -257,9 +313,13 @@ sudo systemctl enable proxy-api proxy-system
 
 ### 1. Configurar APN da Operadora
 
-Edite o arquivo `proxy-manager.sh`:
+Edite o arquivo `proxy-manager.sh` (ANTES ou DEPOIS da instalação):
 
 ```bash
+# Antes da instalação (no repositório clonado)
+nano proxy-manager.sh
+
+# Depois da instalação (no sistema)
 nano ~/proxy-system/proxy-manager.sh
 ```
 
@@ -593,6 +653,23 @@ Contribuições são bem-vindas! Por favor:
 
 ---
 
+## ✅ Estrutura do Repositório
+
+```
+proxyrotativo/
+├── README.md
+├── LICENSE
+├── .gitignore
+├── install.sh           # Script de instalação automática
+├── proxy-manager.sh     # Script principal do sistema
+└── proxy-api/
+    └── main.go          # API REST em Go
+
+Nota: Os arquivos de systemd são criados automaticamente pelo install.sh
+```
+
+---
+
 ## 📄 Licença
 
 Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
@@ -630,6 +707,3 @@ Este software é fornecido "como está", sem garantias de qualquer tipo. O uso d
 Made with ❤️ by Rafael W. Dornelas
 
 </div>
-```
-
-Este README está completo e profissional, pronto para o GitHub! 🚀
