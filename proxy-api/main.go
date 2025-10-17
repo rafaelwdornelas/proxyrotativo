@@ -13,9 +13,18 @@ import (
 	"time"
 )
 
+var SCRIPT_PATH = func() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/root"
+	}
+	path := home + "/proxy-system/proxy-manager.sh"
+	log.Printf("Script path configurado: %s", path)
+	return path
+}()
+
 const (
-	SCRIPT_PATH = "/home/squid/proxy-system/proxy-manager.sh"
-	PORT        = ":5000"
+	PORT = ":5000"
 )
 
 // Response padrão
