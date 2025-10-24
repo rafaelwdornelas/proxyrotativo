@@ -1,644 +1,843 @@
 #!/bin/bash
-# Proxy Manager - Sistema Multi-Modem (Versão Final Completa e Testada)
 
-# Configurações
+# ============================================================================
+# Sistema de Gerenciamento de Proxies Multi-Modem
+# Versão: 2.0 - Instância 3proxy por modem (Suporte até 100 modems)
+# ============================================================================
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURAÇÕES
+# ============================================================================
+
 APN="zap.vivo.com.br"
 USER="vivo"
 PASS="vivo"
-BASE_PROXY_PORT=6000
-BASE_SOCKS_PORT=6100
+BASE_PROXY_PORT=6000   # Portas HTTP: 6001-6100
+BASE_SOCKS_PORT=7000   # Portas SOCKS5: 7001-7100
+MAX_MODEMS=100
+STATUS_FILE="/var/run/proxy-status.json"
+LOG_DIR="/var/log/3proxy"
+CONFIG_DIR="/etc/3proxy"
+PID_DIR="/var/run"
 
-# Arrays para modems funcionais
-declare -a WORKING_MODEMS
-declare -a WORKING_IPS
-declare -a WORKING_GATEWAYS
-declare -a WORKING_INTERFACES
+# Arrays globais para modems detectados
+declare -a DETECTED_MODEMS=()
+declare -a DETECTED_INTERFACES=()
+declare -a DETECTED_IPS=()
+declare -a DETECTED_GATEWAYS=()
+declare -a DETECTED_PREFIXES=()
+declare -a DETECTED_PORTS=()
 
-# Detectar TODOS os modems funcionais
+# ============================================================================
+# FUNÇÕES AUXILIARES
+# ============================================================================
+
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ℹ️  $*"
+}
+
+log_success() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ $*"
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ $*" >&2
+}
+
+log_warning() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  $*"
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "Este script precisa ser executado como root"
+        exit 1
+    fi
+}
+
+create_directories() {
+    mkdir -p "$LOG_DIR" "$CONFIG_DIR" "$PID_DIR"
+}
+
+# ============================================================================
+# DETECÇÃO E CONFIGURAÇÃO DE MODEMS
+# ============================================================================
+
 detect_all_modems() {
-    echo "🔍 Detectando modems funcionais..."
+    log_info "Detectando modems (máximo: $MAX_MODEMS)..."
     
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2)
+    # Limpar arrays
+    DETECTED_MODEMS=()
+    DETECTED_INTERFACES=()
+    DETECTED_IPS=()
+    DETECTED_GATEWAYS=()
+    DETECTED_PREFIXES=()
+    DETECTED_PORTS=()
     
-    if [ -z "$MODEMS" ]; then
-        echo "❌ Nenhum modem detectado!"
+    # Listar todos os modems
+    local MODEM_LIST=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]\+" | cut -d'/' -f2 | sort -n)
+    
+    if [ -z "$MODEM_LIST" ]; then
+        log_error "Nenhum modem detectado pelo ModemManager"
         return 1
     fi
     
-    for MODEM in $MODEMS; do
-        echo ""
-        echo "Testando modem $MODEM..."
-        
-        # Desconectar
-        mmcli -m $MODEM --simple-disconnect 2>/dev/null
-        sleep 3
-        
-        # Conectar
-        if mmcli -m $MODEM --simple-connect="apn=$APN,user=$USER,password=$PASS,ip-type=ipv4" 2>/dev/null; then
-            sleep 10
-            
-            # Pegar configuração
-            BEARER=$(mmcli -m $MODEM 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
-            
-            if [ -z "$BEARER" ]; then
-                echo "  ❌ Modem $MODEM: sem bearer"
-                continue
-            fi
-            
-            IP=$(mmcli -b $BEARER 2>/dev/null | grep "address:" | awk '{print $3}')
-            GATEWAY=$(mmcli -b $BEARER 2>/dev/null | grep "gateway:" | awk '{print $3}')
-            PREFIX=$(mmcli -b $BEARER 2>/dev/null | grep "prefix:" | awk '{print $3}')
-            INTERFACE=$(mmcli -b $BEARER 2>/dev/null | grep "interface:" | awk '{print $3}')
-            
-            if [ -z "$IP" ] || [ -z "$INTERFACE" ]; then
-                echo "  ❌ Modem $MODEM: sem IP/interface"
-                continue
-            fi
-            
-            echo "  📡 Modem $MODEM: $INTERFACE ($IP)"
-            
-            # Configurar interface
-            ip addr flush dev $INTERFACE 2>/dev/null
-            ip addr add $IP/$PREFIX dev $INTERFACE 2>/dev/null
-            ip link set $INTERFACE up 2>/dev/null
-            
-            # Testar conectividade
-            echo "  🔄 Testando conectividade..."
-            if timeout 10 ping -I $INTERFACE -c 2 -W 5 8.8.8.8 > /dev/null 2>&1; then
-                echo "  ✅ Modem $MODEM FUNCIONA!"
-                
-                WORKING_MODEMS+=($MODEM)
-                WORKING_IPS+=($IP)
-                WORKING_GATEWAYS+=($GATEWAY)
-                WORKING_INTERFACES+=($INTERFACE)
-            else
-                echo "  ❌ Modem $MODEM: sem conectividade"
-            fi
-        else
-            echo "  ❌ Modem $MODEM: falha ao conectar"
+    local total_modems=$(echo "$MODEM_LIST" | wc -l)
+    log_info "Total de modems detectados: $total_modems"
+    
+    local port_counter=1
+    local processed=0
+    
+    for MODEM_ID in $MODEM_LIST; do
+        if [ $port_counter -gt $MAX_MODEMS ]; then
+            log_warning "Limite de $MAX_MODEMS modems atingido"
+            break
         fi
+        
+        log_info "Processando modem $MODEM_ID (${port_counter}/${MAX_MODEMS})..."
+        
+        # Desconectar primeiro (garantir estado limpo)
+        mmcli -m $MODEM_ID --simple-disconnect 2>/dev/null || true
+        sleep 2
+        
+        # Conectar modem
+        log_info "  Conectando..."
+        if ! mmcli -m $MODEM_ID --simple-connect="apn=$APN,user=$USER,password=$PASS,ip-type=ipv4" 2>/dev/null; then
+            log_error "  Falha ao conectar modem $MODEM_ID"
+            continue
+        fi
+        
+        sleep 8
+        
+        # Obter bearer
+        local BEARER=$(mmcli -m $MODEM_ID 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
+        
+        if [ -z "$BEARER" ]; then
+            log_error "  Modem $MODEM_ID: Bearer não encontrado"
+            continue
+        fi
+        
+        # Obter configurações de rede
+        local IP=$(mmcli -b $BEARER 2>/dev/null | grep -w "address:" | awk '{print $3}')
+        local GATEWAY=$(mmcli -b $BEARER 2>/dev/null | grep -w "gateway:" | awk '{print $3}')
+        local PREFIX=$(mmcli -b $BEARER 2>/dev/null | grep -w "prefix:" | awk '{print $3}')
+        local INTERFACE=$(mmcli -b $BEARER 2>/dev/null | grep -w "interface:" | awk '{print $3}')
+        
+        if [ -z "$IP" ] || [ -z "$INTERFACE" ] || [ -z "$GATEWAY" ]; then
+            log_error "  Modem $MODEM_ID: Configuração incompleta (IP: $IP, IFACE: $INTERFACE, GW: $GATEWAY)"
+            continue
+        fi
+        
+        # Configurar interface de rede
+        log_info "  Configurando interface $INTERFACE..."
+        ip addr flush dev $INTERFACE 2>/dev/null || true
+        ip addr add $IP/$PREFIX dev $INTERFACE 2>/dev/null || true
+        ip link set $INTERFACE up 2>/dev/null || true
+        
+        # Testar conectividade
+        log_info "  Testando conectividade..."
+        if ! timeout 10 ping -I $INTERFACE -c 2 -W 5 8.8.8.8 >/dev/null 2>&1; then
+            log_error "  Modem $MODEM_ID: Sem conectividade"
+            continue
+        fi
+        
+        # Modem funcional - adicionar aos arrays
+        local PROXY_PORT=$((BASE_PROXY_PORT + port_counter))
+        local SOCKS_PORT=$((BASE_SOCKS_PORT + port_counter))
+        
+        DETECTED_MODEMS+=("$MODEM_ID")
+        DETECTED_INTERFACES+=("$INTERFACE")
+        DETECTED_IPS+=("$IP")
+        DETECTED_GATEWAYS+=("$GATEWAY")
+        DETECTED_PREFIXES+=("$PREFIX")
+        DETECTED_PORTS+=("$PROXY_PORT")
+        
+        log_success "  Modem $MODEM_ID OK: $INTERFACE ($IP) → HTTP:$PROXY_PORT SOCKS:$SOCKS_PORT"
+        
+        port_counter=$((port_counter + 1))
+        processed=$((processed + 1))
     done
     
     echo ""
-    echo "========================================="
-    if [ ${#WORKING_MODEMS[@]} -eq 0 ]; then
-        echo "❌ ERRO: Nenhum modem funcional!"
+    log_info "========================================="
+    if [ ${#DETECTED_MODEMS[@]} -eq 0 ]; then
+        log_error "Nenhum modem funcional detectado"
         return 1
     else
-        echo "✅ Modems funcionais: ${#WORKING_MODEMS[@]}"
-        for i in "${!WORKING_MODEMS[@]}"; do
-            echo "   Modem ${WORKING_MODEMS[$i]}: ${WORKING_INTERFACES[$i]} (${WORKING_IPS[$i]})"
+        log_success "Total de modems funcionais: ${#DETECTED_MODEMS[@]}"
+        echo ""
+        for i in "${!DETECTED_MODEMS[@]}"; do
+            printf "   [%2d] Modem %-3s | %-6s | %-15s | HTTP:%-5d SOCKS:%-5d\n" \
+                $((i+1)) \
+                "${DETECTED_MODEMS[$i]}" \
+                "${DETECTED_INTERFACES[$i]}" \
+                "${DETECTED_IPS[$i]}" \
+                "${DETECTED_PORTS[$i]}" \
+                $((${DETECTED_PORTS[$i]} + 1000))
         done
+        log_info "========================================="
         return 0
     fi
 }
 
-# Configurar policy routing por IP de origem
-setup_policy_routing() {
-    echo "  🔀 Configurando policy routing..."
-    
-    # Remover regras antigas de policy routing (priority 90-99)
-    for PRIO in {90..99}; do
-        ip rule del priority $PRIO 2>/dev/null || true
-    done
-    
-    # Detectar IPs atuais e criar regras
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2 | sort)
-    
-    PRIORITY=99
-    for MODEM in $MODEMS; do
-        BEARER=$(mmcli -m $MODEM 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
-        if [ -n "$BEARER" ]; then
-            IP=$(mmcli -b $BEARER 2>/dev/null | grep "address:" | awk '{print $3}')
-            IFACE=$(mmcli -b $BEARER 2>/dev/null | grep "interface:" | awk '{print $3}')
-            
-            if [ -n "$IP" ] && [ -n "$IFACE" ]; then
-                # Descobrir TABLE_ID baseado na interface
-                if [ "$IFACE" == "wwan0" ]; then
-                    TABLE_ID=101
-                elif [ "$IFACE" == "wwan1" ]; then
-                    TABLE_ID=100
-                else
-                    TABLE_ID=$((102 + $(echo $MODEMS | tr ' ' '\n' | grep -n "^$MODEM$" | cut -d: -f1)))
-                fi
-                
-                # Adicionar regra de policy routing por IP de origem
-                ip rule add from $IP table $TABLE_ID priority $PRIORITY 2>/dev/null || true
-                echo "    ✓ IP $IP → Tabela $TABLE_ID (priority $PRIORITY)"
-                
-                PRIORITY=$((PRIORITY - 1))
-            fi
-        fi
-    done
-    
-    # Limpar cache de rotas
-    ip route flush cache 2>/dev/null || true
-    
-    echo "  ✓ Policy routing configurado"
-}
+# ============================================================================
+# CONFIGURAÇÃO DO SISTEMA
+# ============================================================================
 
-# Configurar sistema
-setup_system() {
-    echo ""
-    echo "⚙️  Configurando sistema..."
-    
-    # Limpar rt_tables
-    cp /etc/iproute2/rt_tables /etc/iproute2/rt_tables.backup 2>/dev/null
-    grep -v "wwan" /etc/iproute2/rt_tables 2>/dev/null > /tmp/rt_tables.tmp
-    mv /tmp/rt_tables.tmp /etc/iproute2/rt_tables
-    
-    # Limpar regras antigas
-    for PRIO in {100..150}; do
-        ip rule del priority $PRIO 2>/dev/null || true
-    done
-    
-    # Configurar cada modem
-    for i in "${!WORKING_MODEMS[@]}"; do
-        IFACE=${WORKING_INTERFACES[$i]}
-        GATEWAY=${WORKING_GATEWAYS[$i]}
-        
-        # Rota padrão com métrica diferente
-        METRIC=$((10 + i))
-        ip route del default via $GATEWAY dev $IFACE 2>/dev/null || true
-        ip route add default via $GATEWAY dev $IFACE metric $METRIC
-        
-        # Tabela de roteamento individual
-        TABLE_ID=$((100 + i))
-        TABLE_NAME="${IFACE}_table"
-        
-        echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
-        
-        ip route flush table $TABLE_ID 2>/dev/null || true
-        ip route add default via $GATEWAY dev $IFACE table $TABLE_ID
-        
-        # NAT
-        iptables -t nat -D POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null || true
-        iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
-        
-        # FORWARD rules (permitir tráfego da LAN para modems)
-        iptables -A FORWARD -i ens33 -o $IFACE -j ACCEPT 2>/dev/null || true
-        iptables -A FORWARD -i $IFACE -o ens33 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-        
-        # Marcação de pacotes por porta
-        PROXY_PORT=$((BASE_PROXY_PORT + i + 1))
-        SOCKS_PORT=$((BASE_SOCKS_PORT + i + 1))
-        MARK=$((i + 1))
-        
-        
-        # Regra de roteamento por marca
-        PRIORITY=$((100 + i))
-        ip rule add from all fwmark $MARK table $TABLE_ID priority $PRIORITY 2>/dev/null || true
-        
-        echo "  ✓ $IFACE: HTTP=$PROXY_PORT SOCKS=$SOCKS_PORT → Tabela $TABLE_ID"
-    done
+setup_routing() {
+    log_info "Configurando roteamento..."
     
     # Habilitar IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward
     
-    # Tornar IP forwarding permanente
+    # Tornar permanente
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     fi
     
-    # Criar config do 3proxy
-    cat > /etc/3proxy/3proxy.cfg << EOF
-daemon
-log /var/log/3proxy/3proxy.log D
-rotate 30
-auth none
-allow *
-
-EOF
+    # Limpar tabela de roteamento customizada
+    cp /etc/iproute2/rt_tables /etc/iproute2/rt_tables.backup 2>/dev/null || true
+    grep -v "^[0-9].*proxy_" /etc/iproute2/rt_tables 2>/dev/null > /tmp/rt_tables.tmp || true
+    mv /tmp/rt_tables.tmp /etc/iproute2/rt_tables
     
-    # Proxies individuais (1 por modem) - CORREÇÃO: bind em 0.0.0.0, saída pelo IP do modem
-for i in "${!WORKING_MODEMS[@]}"; do
-    IP=${WORKING_IPS[$i]}
-    IFACE=${WORKING_INTERFACES[$i]}
-    PROXY_PORT=$((BASE_PROXY_PORT + i + 1))
-    SOCKS_PORT=$((BASE_SOCKS_PORT + i + 1))
-    
-    cat >> /etc/3proxy/3proxy.cfg << EOF
-# Modem ${WORKING_MODEMS[$i]} - $IFACE ($IP)
-proxy -p$PROXY_PORT -e$IP
-socks -p$SOCKS_PORT -e$IP
-
-EOF
-done
-    
-    # Iniciar 3proxy
-    killall 3proxy 2>/dev/null || true
-    sleep 2
-    /usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
-    
-    # Configurar policy routing por IP de origem
-    setup_policy_routing
-    
-    echo ""
-    echo "========================================="
-    echo "✅ SISTEMA CONFIGURADO!"
-    echo "========================================="
-    echo ""
-    echo "PROXIES ATIVOS:"
-    for i in "${!WORKING_MODEMS[@]}"; do
-        PROXY_PORT=$((BASE_PROXY_PORT + i + 1))
-        SOCKS_PORT=$((BASE_SOCKS_PORT + i + 1))
-        echo "  Porta HTTP $PROXY_PORT | SOCKS5 $SOCKS_PORT → Modem ${WORKING_MODEMS[$i]} (${WORKING_INTERFACES[$i]}: ${WORKING_IPS[$i]})"
+    # Limpar regras antigas (priority 100-200)
+    for PRIO in {100..200}; do
+        ip rule del priority $PRIO 2>/dev/null || true
     done
-    echo ""
-    echo "API: http://SEU_IP:5000"
-    echo "========================================="
+    
+    # Configurar roteamento para cada modem
+    for i in "${!DETECTED_MODEMS[@]}"; do
+        local IFACE="${DETECTED_INTERFACES[$i]}"
+        local IP="${DETECTED_IPS[$i]}"
+        local GATEWAY="${DETECTED_GATEWAYS[$i]}"
+        local TABLE_ID=$((100 + i))
+        local TABLE_NAME="proxy_${IFACE}"
+        local METRIC=$((10 + i))
+        
+        # Adicionar tabela
+        echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
+        
+        # Limpar e criar rota padrão na tabela
+        ip route flush table $TABLE_ID 2>/dev/null || true
+        ip route add default via $GATEWAY dev $IFACE table $TABLE_ID
+        
+        # Rota padrão com métrica (fallback)
+        ip route del default via $GATEWAY dev $IFACE 2>/dev/null || true
+        ip route add default via $GATEWAY dev $IFACE metric $METRIC
+        
+        # Policy routing por IP de origem
+        ip rule add from $IP table $TABLE_ID priority $((100 + i)) 2>/dev/null || true
+        
+        # NAT (MASQUERADE)
+        iptables -t nat -D POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+        
+        # FORWARD rules
+        iptables -A FORWARD -i $IFACE -j ACCEPT 2>/dev/null || true
+        iptables -A FORWARD -o $IFACE -j ACCEPT 2>/dev/null || true
+        
+        log_success "  $IFACE → Tabela $TABLE_ID (Métrica $METRIC)"
+    done
+    
+    # Flush cache
+    ip route flush cache 2>/dev/null || true
 }
 
-# Reconstruir config do 3proxy após renovação
-rebuild_3proxy_config() {
-    echo "  🔄 Atualizando 3proxy..."
+create_proxy_config() {
+    local INDEX=$1
+    local MODEM_ID="${DETECTED_MODEMS[$INDEX]}"
+    local IFACE="${DETECTED_INTERFACES[$INDEX]}"
+    local IP="${DETECTED_IPS[$INDEX]}"
+    local PROXY_PORT="${DETECTED_PORTS[$INDEX]}"
+    local SOCKS_PORT=$((PROXY_PORT + 1000))
     
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2 | sort)
+    local CONFIG_FILE="${CONFIG_DIR}/3proxy_${PROXY_PORT}.cfg"
+    local PID_FILE="${PID_DIR}/3proxy_${PROXY_PORT}.pid"
+    local LOG_FILE="${LOG_DIR}/3proxy_${PROXY_PORT}.log"
     
-    declare -a CURRENT_IPS
-    declare -a CURRENT_INTERFACES
-    declare -a CURRENT_MODEMS
-    
-    for MODEM in $MODEMS; do
-        BEARER=$(mmcli -m $MODEM 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
-        if [ -n "$BEARER" ]; then
-            IP=$(mmcli -b $BEARER 2>/dev/null | grep "address:" | awk '{print $3}')
-            IFACE=$(mmcli -b $BEARER 2>/dev/null | grep "interface:" | awk '{print $3}')
-            
-            if [ -n "$IP" ] && [ -n "$IFACE" ]; then
-                CURRENT_MODEMS+=($MODEM)
-                CURRENT_IPS+=($IP)
-                CURRENT_INTERFACES+=($IFACE)
-            fi
-        fi
-    done
-    
-    # Recriar config
-    cat > /etc/3proxy/3proxy.cfg << EOF
+    cat > "$CONFIG_FILE" << EOF
+# Configuração 3proxy - Modem ${MODEM_ID}
+# Interface: ${IFACE}
+# IP: ${IP}
+# Gerado em: $(date)
+
 daemon
-log /var/log/3proxy/3proxy.log D
+pidfile ${PID_FILE}
+log ${LOG_FILE} D
 rotate 30
 auth none
 allow *
 
+# Proxies
+proxy -p${PROXY_PORT} -e${IP}
+socks -p${SOCKS_PORT} -e${IP}
 EOF
     
-    for i in "${!CURRENT_IPS[@]}"; do
-    IP=${CURRENT_IPS[$i]}
-    IFACE=${CURRENT_INTERFACES[$i]}
-    MODEM=${CURRENT_MODEMS[$i]}
-    PROXY_PORT=$((BASE_PROXY_PORT + i + 1))
-    SOCKS_PORT=$((BASE_SOCKS_PORT + i + 1))
-    
-    cat >> /etc/3proxy/3proxy.cfg << EOF
-# Modem $MODEM - $IFACE ($IP)
-proxy -p$PROXY_PORT -e$IP
-socks -p$SOCKS_PORT -e$IP
+    log_success "  Config criado: $CONFIG_FILE"
+}
 
-EOF
-done
+start_proxy_instance() {
+    local PROXY_PORT=$1
+    local CONFIG_FILE="${CONFIG_DIR}/3proxy_${PROXY_PORT}.cfg"
+    local PID_FILE="${PID_DIR}/3proxy_${PROXY_PORT}.pid"
     
-    # Reiniciar 3proxy
-    killall 3proxy 2>/dev/null || true
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log_error "Config não encontrado: $CONFIG_FILE"
+        return 1
+    fi
+    
+    # Parar instância se estiver rodando
+    if [ -f "$PID_FILE" ]; then
+        local OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            kill "$OLD_PID" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    
+    # Iniciar nova instância
+    /usr/local/bin/3proxy "$CONFIG_FILE"
+    
     sleep 1
-    /usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
     
-    # Reconfigurar policy routing com novos IPs
-    setup_policy_routing
-    
-    echo "  ✓ 3proxy reconfigurado"
-}
-
-# Renovar IP de porta específica (ModemManager - Otimizado)
-renew_by_port() {
-    TARGET_PORT=$1
-    
-    if [ -z "$TARGET_PORT" ]; then
-        echo "❌ Erro: Porta não especificada"
-        return 1
-    fi
-    
-    echo "🔄 Renovando IP da porta $TARGET_PORT"
-    echo ""
-    
-    # PASSO 1: Ler config do 3proxy para descobrir interface e IP interno
-    if [ ! -f /etc/3proxy/3proxy.cfg ]; then
-        echo "❌ Erro: Config do 3proxy não encontrada"
-        return 1
-    fi
-    
-    CONFIG_BLOCK=$(grep -B1 "^proxy -p$TARGET_PORT " /etc/3proxy/3proxy.cfg)
-    
-    if [ -z "$CONFIG_BLOCK" ]; then
-        echo "❌ Erro: Porta $TARGET_PORT não encontrada no config do 3proxy"
-        return 1
-    fi
-    
-    TARGET_INTERFACE=$(echo "$CONFIG_BLOCK" | grep "^# Modem" | sed -n 's/.*- \([^ ]*\) (.*/\1/p')
-    TARGET_INTERNAL_IP=$(echo "$CONFIG_BLOCK" | grep "^# Modem" | sed -n 's/.*(\([^)]*\)).*/\1/p')
-    
-    if [ -z "$TARGET_INTERFACE" ] || [ -z "$TARGET_INTERNAL_IP" ]; then
-        echo "❌ Erro: Não foi possível extrair informações do config"
-        return 1
-    fi
-    
-    echo "  📋 Config da porta $TARGET_PORT:"
-    echo "     Interface: $TARGET_INTERFACE"
-    echo "     IP interno: $TARGET_INTERNAL_IP"
-    echo ""
-    
-    # PASSO 2: Descobrir qual modem tem esse IP interno
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2)
-    
-    MODEM_TO_RENEW=""
-    MODEM_INDEX=""
-    
-    ACTIVE_INDEX=0
-    
-    for MODEM in $MODEMS; do
-        BEARER=$(mmcli -m $MODEM 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
-        
-        if [ -n "$BEARER" ]; then
-            CURRENT_IP=$(mmcli -b $BEARER 2>/dev/null | grep "address:" | awk '{print $3}')
-            CURRENT_IFACE=$(mmcli -b $BEARER 2>/dev/null | grep "interface:" | awk '{print $3}')
-            
-            if [ "$CURRENT_IP" == "$TARGET_INTERNAL_IP" ] || [ "$CURRENT_IFACE" == "$TARGET_INTERFACE" ]; then
-                MODEM_TO_RENEW=$MODEM
-                MODEM_INDEX=$ACTIVE_INDEX
-                break
-            fi
-            
-            ACTIVE_INDEX=$((ACTIVE_INDEX + 1))
+    # Verificar se iniciou
+    if [ -f "$PID_FILE" ]; then
+        local NEW_PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$NEW_PID" ] && kill -0 "$NEW_PID" 2>/dev/null; then
+            log_success "  3proxy iniciado: porta $PROXY_PORT (PID: $NEW_PID)"
+            return 0
         fi
-    done
-    
-    if [ -z "$MODEM_TO_RENEW" ]; then
-        echo "❌ Erro: Nenhum modem encontrado"
-        return 1
     fi
     
-    echo "  ✅ Modem identificado: $MODEM_TO_RENEW"
-    echo ""
-    
-    # PASSO 3: Pegar IP público atual
-    echo "  🌐 Obtendo IP público atual..."
-    OLD_PUBLIC_IP=$(timeout 10 curl -s --interface $TARGET_INTERFACE https://api.ipify.org 2>/dev/null)
-    
-    if [ -z "$OLD_PUBLIC_IP" ]; then
-        OLD_PUBLIC_IP="N/A"
-        echo "  ⚠️  Não foi possível obter IP público antigo"
-    else
-        echo "  📍 IP público atual: $OLD_PUBLIC_IP"
-    fi
-    
-    echo ""
-    echo "📡 Iniciando renovação do Modem $MODEM_TO_RENEW..."
-    
-    # PASSO 4: Renovação otimizada
-    MAX_ATTEMPTS=3
-    ATTEMPT=1
-    
-    while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-        echo ""
-        echo "  🔄 Tentativa $ATTEMPT de $MAX_ATTEMPTS..."
-        
-        # 1. Desconectar
-        echo "  📴 Desconectando modem..."
-        mmcli -m $MODEM_TO_RENEW --simple-disconnect 2>/dev/null
-        
-        # 2. Modo offline (força reset da sessão)
-        echo "  🛑 Forçando reset de sessão..."
-        mmcli -m $MODEM_TO_RENEW --set-power-state-low 2>/dev/null || true
-        sleep 5
-        
-        # 3. Aguardar liberação do IP (REDUZIDO para 20s)
-        echo "  ⏳ Aguardando liberação do IP (20s)..."
-        sleep 20
-        
-        # 4. Modo online
-        echo "  ⚡ Reativando modem..."
-        mmcli -m $MODEM_TO_RENEW --set-power-state-on 2>/dev/null || true
-        sleep 5
-        
-        # 5. Reconectar
-        echo "  🔌 Reconectando..."
-        if mmcli -m $MODEM_TO_RENEW --simple-connect="apn=$APN,user=$USER,password=$PASS,ip-type=ipv4" 2>/dev/null; then
-            sleep 10
-            
-            # Obter nova configuração
-            BEARER=$(mmcli -m $MODEM_TO_RENEW 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
-            
-            if [ -z "$BEARER" ]; then
-                echo "  ❌ Falha ao obter bearer"
-                ATTEMPT=$((ATTEMPT + 1))
-                continue
-            fi
-            
-            NEW_IP=$(mmcli -b $BEARER 2>/dev/null | grep "address:" | awk '{print $3}')
-            GATEWAY=$(mmcli -b $BEARER 2>/dev/null | grep "gateway:" | awk '{print $3}')
-            PREFIX=$(mmcli -b $BEARER 2>/dev/null | grep "prefix:" | awk '{print $3}')
-            INTERFACE=$(mmcli -b $BEARER 2>/dev/null | grep "interface:" | awk '{print $3}')
-            
-            if [ -z "$NEW_IP" ] || [ -z "$INTERFACE" ]; then
-                echo "  ❌ Falha ao obter configuração de rede"
-                ATTEMPT=$((ATTEMPT + 1))
-                continue
-            fi
-            
-            echo "  🆕 Novo IP interno: $NEW_IP ($INTERFACE)"
-            
-            # Reconfigurar interface
-            ip addr flush dev $INTERFACE 2>/dev/null
-            ip addr add $NEW_IP/$PREFIX dev $INTERFACE
-            ip link set $INTERFACE up
-            
-            # Reconfigurar rota
-            METRIC=$((10 + MODEM_INDEX))
-            ip route del default via $GATEWAY dev $INTERFACE 2>/dev/null || true
-            ip route add default via $GATEWAY dev $INTERFACE metric $METRIC
-            
-            # Atualizar tabela de roteamento
-            TABLE_ID=$((100 + MODEM_INDEX))
-            ip route flush table $TABLE_ID 2>/dev/null || true
-            ip route add default via $GATEWAY dev $INTERFACE table $TABLE_ID
-            
-            # Reconfigurar NAT
-            iptables -t nat -D POSTROUTING -o $INTERFACE -j MASQUERADE 2>/dev/null || true
-            iptables -t nat -A POSTROUTING -o $INTERFACE -j MASQUERADE
-            
-            # Testar conectividade
-            echo "  🔄 Testando conectividade..."
-            if timeout 10 ping -I $INTERFACE -c 2 -W 5 8.8.8.8 > /dev/null 2>&1; then
-                echo "  ✅ Conectividade OK"
-                
-                # Reconfigurar 3proxy
-                echo "  🔄 Reconfigurando 3proxy..."
-                rebuild_3proxy_config
-                
-                # Aguardar estabilização
-                sleep 5
-                
-                # Obter NOVO IP público
-                echo "  🌐 Obtendo novo IP público..."
-                NEW_PUBLIC_IP=$(timeout 10 curl -s --interface $INTERFACE https://api.ipify.org 2>/dev/null)
-                
-                if [ -z "$NEW_PUBLIC_IP" ]; then
-                    echo "  ⚠️  Não foi possível obter novo IP público"
-                    ATTEMPT=$((ATTEMPT + 1))
-                    continue
-                fi
-                
-                echo "  📍 Novo IP público: $NEW_PUBLIC_IP"
-                
-                # Verificar se IP realmente mudou
-                if [ "$NEW_PUBLIC_IP" != "$OLD_PUBLIC_IP" ] && [ "$OLD_PUBLIC_IP" != "N/A" ]; then
-                    echo ""
-                    echo "========================================="
-                    echo "✅ IP RENOVADO COM SUCESSO"
-                    echo "========================================="
-                    echo "Porta: $TARGET_PORT"
-                    echo "Modem: $MODEM_TO_RENEW"
-                    echo "Interface: $INTERFACE"
-                    echo "IP interno: $TARGET_INTERNAL_IP → $NEW_IP"
-                    echo "IP público: $OLD_PUBLIC_IP → $NEW_PUBLIC_IP"
-                    echo "========================================="
-                    return 0
-                elif [ "$OLD_PUBLIC_IP" == "N/A" ]; then
-                    echo ""
-                    echo "========================================="
-                    echo "✅ MODEM RECONECTADO"
-                    echo "========================================="
-                    echo "Porta: $TARGET_PORT"
-                    echo "Modem: $MODEM_TO_RENEW"
-                    echo "Interface: $INTERFACE"
-                    echo "IP interno: $NEW_IP"
-                    echo "IP público: $NEW_PUBLIC_IP"
-                    echo "========================================="
-                    return 0
-                else
-                    echo "  ⚠️  IP não mudou: $NEW_PUBLIC_IP"
-                    echo "  🔄 Operadora manteve o IP. Tentando novamente..."
-                    ATTEMPT=$((ATTEMPT + 1))
-                fi
-            else
-                echo "  ❌ Sem conectividade"
-                ATTEMPT=$((ATTEMPT + 1))
-            fi
-        else
-            echo "  ❌ Falha ao conectar"
-            ATTEMPT=$((ATTEMPT + 1))
-        fi
-    done
-    
-    echo ""
-    echo "========================================="
-    echo "❌ FALHA AO RENOVAR IP"
-    echo "========================================="
-    echo "Tentativas: $MAX_ATTEMPTS"
-    if [ "$OLD_PUBLIC_IP" != "N/A" ]; then
-        echo "IP permanece: $OLD_PUBLIC_IP"
-    fi
-    echo ""
-    echo "Possíveis causas:"
-    echo "- Operadora mantém IP por período mínimo"
-    echo "- CGNAT com pool limitado de IPs"
-    echo "- Necessário aguardar mais tempo"
-    echo "========================================="
+    log_error "  Falha ao iniciar 3proxy na porta $PROXY_PORT"
     return 1
 }
 
-# Status do sistema
+setup_all_proxies() {
+    log_info "Configurando instâncias do 3proxy..."
+    
+    local success_count=0
+    
+    for i in "${!DETECTED_PORTS[@]}"; do
+        local PROXY_PORT="${DETECTED_PORTS[$i]}"
+        
+        create_proxy_config "$i"
+        
+        if start_proxy_instance "$PROXY_PORT"; then
+            success_count=$((success_count + 1))
+        fi
+    done
+    
+    echo ""
+    log_info "========================================="
+    log_success "Instâncias 3proxy iniciadas: $success_count/${#DETECTED_PORTS[@]}"
+    log_info "========================================="
+}
+
+save_status() {
+    log_info "Salvando status do sistema..."
+    
+    local json="{"
+    json+="\"timestamp\":\"$(date -Iseconds)\","
+    json+="\"modem_count\":${#DETECTED_MODEMS[@]},"
+    json+="\"modems\":["
+    
+    for i in "${!DETECTED_MODEMS[@]}"; do
+        [ $i -gt 0 ] && json+=","
+        json+="{"
+        json+="\"id\":\"${DETECTED_MODEMS[$i]}\","
+        json+="\"interface\":\"${DETECTED_INTERFACES[$i]}\","
+        json+="\"ip\":\"${DETECTED_IPS[$i]}\","
+        json+="\"gateway\":\"${DETECTED_GATEWAYS[$i]}\","
+        json+="\"http_port\":${DETECTED_PORTS[$i]},"
+        json+="\"socks_port\":$((${DETECTED_PORTS[$i]} + 1000))"
+        json+="}"
+    done
+    
+    json+="]}"
+    
+    echo "$json" > "$STATUS_FILE"
+    chmod 644 "$STATUS_FILE"
+}
+
+# ============================================================================
+# RENOVAÇÃO DE IP POR PORTA
+# ============================================================================
+
+find_modem_by_port() {
+    local TARGET_PORT=$1
+    
+    for i in "${!DETECTED_PORTS[@]}"; do
+        if [ "${DETECTED_PORTS[$i]}" -eq "$TARGET_PORT" ]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+renew_ip_by_port() {
+    local TARGET_PORT=$1
+    
+    if [ -z "$TARGET_PORT" ]; then
+        log_error "Porta não especificada"
+        return 1
+    fi
+    
+    log_info "========================================="
+    log_info "Renovando IP da porta $TARGET_PORT"
+    log_info "========================================="
+    
+    # Buscar índice do modem
+    local MODEM_INDEX
+    if ! MODEM_INDEX=$(find_modem_by_port "$TARGET_PORT"); then
+        log_error "Porta $TARGET_PORT não encontrada no sistema"
+        return 1
+    fi
+    
+    local MODEM_ID="${DETECTED_MODEMS[$MODEM_INDEX]}"
+    local OLD_IFACE="${DETECTED_INTERFACES[$MODEM_INDEX]}"
+    local OLD_IP="${DETECTED_IPS[$MODEM_INDEX]}"
+    local GATEWAY="${DETECTED_GATEWAYS[$MODEM_INDEX]}"
+    local PREFIX="${DETECTED_PREFIXES[$MODEM_INDEX]}"
+    local SOCKS_PORT=$((TARGET_PORT + 1000))
+    
+    log_info "Modem ID: $MODEM_ID"
+    log_info "Interface atual: $OLD_IFACE"
+    log_info "IP atual: $OLD_IP"
+    
+    # Obter IP público atual
+    log_info "Obtendo IP público atual..."
+    local OLD_PUBLIC_IP=$(timeout 10 curl -s --interface "$OLD_IFACE" https://api.ipify.org 2>/dev/null || echo "N/A")
+    log_info "IP público atual: $OLD_PUBLIC_IP"
+    
+    # Processo de renovação
+    local MAX_ATTEMPTS=3
+    local ATTEMPT=1
+    
+    while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+        echo ""
+        log_info "Tentativa $ATTEMPT de $MAX_ATTEMPTS"
+        log_info "-----------------------------------"
+        
+        # 1. Desconectar modem
+        log_info "Desconectando modem..."
+        mmcli -m "$MODEM_ID" --simple-disconnect 2>/dev/null || true
+        
+        # 2. Modo low power (força reset)
+        log_info "Forçando reset de sessão..."
+        mmcli -m "$MODEM_ID" --set-power-state-low 2>/dev/null || true
+        sleep 5
+        
+        # 3. Aguardar liberação do IP
+        log_info "Aguardando liberação do IP (20s)..."
+        sleep 20
+        
+        # 4. Modo online
+        log_info "Reativando modem..."
+        mmcli -m "$MODEM_ID" --set-power-state-on 2>/dev/null || true
+        sleep 5
+        
+        # 5. Reconectar
+        log_info "Reconectando..."
+        if ! mmcli -m "$MODEM_ID" --simple-connect="apn=$APN,user=$USER,password=$PASS,ip-type=ipv4" 2>/dev/null; then
+            log_error "Falha ao reconectar"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        
+        sleep 10
+        
+        # 6. Obter novas configurações
+        local BEARER=$(mmcli -m "$MODEM_ID" 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
+        
+        if [ -z "$BEARER" ]; then
+            log_error "Bearer não encontrado"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        
+        local NEW_IP=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "address:" | awk '{print $3}')
+        local NEW_GATEWAY=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "gateway:" | awk '{print $3}')
+        local NEW_PREFIX=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "prefix:" | awk '{print $3}')
+        local NEW_IFACE=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "interface:" | awk '{print $3}')
+        
+        if [ -z "$NEW_IP" ] || [ -z "$NEW_IFACE" ]; then
+            log_error "Configuração incompleta obtida"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        
+        log_info "Nova configuração: $NEW_IFACE ($NEW_IP)"
+        
+        # 7. Configurar interface
+        log_info "Configurando interface..."
+        ip addr flush dev "$NEW_IFACE" 2>/dev/null || true
+        ip addr add "$NEW_IP/$NEW_PREFIX" dev "$NEW_IFACE"
+        ip link set "$NEW_IFACE" up
+        
+        # 8. Reconfigurar roteamento
+        log_info "Reconfigurando roteamento..."
+        local TABLE_ID=$((100 + MODEM_INDEX))
+        local METRIC=$((10 + MODEM_INDEX))
+        
+        # Rota padrão
+        ip route del default via "$NEW_GATEWAY" dev "$NEW_IFACE" 2>/dev/null || true
+        ip route add default via "$NEW_GATEWAY" dev "$NEW_IFACE" metric "$METRIC"
+        
+        # Tabela específica
+        ip route flush table "$TABLE_ID" 2>/dev/null || true
+        ip route add default via "$NEW_GATEWAY" dev "$NEW_IFACE" table "$TABLE_ID"
+        
+        # Policy routing
+        ip rule del from "$OLD_IP" table "$TABLE_ID" 2>/dev/null || true
+        ip rule add from "$NEW_IP" table "$TABLE_ID" priority $((100 + MODEM_INDEX))
+        
+        # NAT
+        iptables -t nat -D POSTROUTING -o "$OLD_IFACE" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -A POSTROUTING -o "$NEW_IFACE" -j MASQUERADE
+        
+        # Flush cache
+        ip route flush cache 2>/dev/null || true
+        
+        # 9. Testar conectividade
+        log_info "Testando conectividade..."
+        if ! timeout 10 ping -I "$NEW_IFACE" -c 2 -W 5 8.8.8.8 >/dev/null 2>&1; then
+            log_error "Sem conectividade"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        
+        log_success "Conectividade OK"
+        
+        # 10. Reconfigurar 3proxy APENAS desta porta
+        log_info "Reconfigurando 3proxy..."
+        
+        # Atualizar config
+        local CONFIG_FILE="${CONFIG_DIR}/3proxy_${TARGET_PORT}.cfg"
+        local PID_FILE="${PID_DIR}/3proxy_${TARGET_PORT}.pid"
+        local LOG_FILE="${LOG_DIR}/3proxy_${TARGET_PORT}.log"
+        
+        cat > "$CONFIG_FILE" << EOF
+# Configuração 3proxy - Modem ${MODEM_ID}
+# Interface: ${NEW_IFACE}
+# IP: ${NEW_IP}
+# Atualizado em: $(date)
+
+daemon
+pidfile ${PID_FILE}
+log ${LOG_FILE} D
+rotate 30
+auth none
+allow *
+
+# Proxies
+proxy -p${TARGET_PORT} -e${NEW_IP}
+socks -p${SOCKS_PORT} -e${NEW_IP}
+EOF
+        
+        # Reiniciar APENAS esta instância
+        if [ -f "$PID_FILE" ]; then
+            local OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$OLD_PID" ]; then
+                kill "$OLD_PID" 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+        
+        /usr/local/bin/3proxy "$CONFIG_FILE"
+        sleep 2
+        
+        # 11. Obter novo IP público
+        log_info "Obtendo novo IP público..."
+        local NEW_PUBLIC_IP=$(timeout 10 curl -s --interface "$NEW_IFACE" https://api.ipify.org 2>/dev/null || echo "N/A")
+        
+        if [ -z "$NEW_PUBLIC_IP" ] || [ "$NEW_PUBLIC_IP" == "N/A" ]; then
+            log_warning "Não foi possível obter IP público"
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        
+        log_info "Novo IP público: $NEW_PUBLIC_IP"
+        
+        # 12. Atualizar arrays globais
+        DETECTED_IPS[$MODEM_INDEX]="$NEW_IP"
+        DETECTED_INTERFACES[$MODEM_INDEX]="$NEW_IFACE"
+        DETECTED_GATEWAYS[$MODEM_INDEX]="$NEW_GATEWAY"
+        DETECTED_PREFIXES[$MODEM_INDEX]="$NEW_PREFIX"
+        
+        # Salvar novo status
+        save_status
+        
+        # Verificar se IP mudou
+        echo ""
+        log_info "========================================="
+        if [ "$NEW_PUBLIC_IP" != "$OLD_PUBLIC_IP" ] && [ "$OLD_PUBLIC_IP" != "N/A" ]; then
+            log_success "IP RENOVADO COM SUCESSO!"
+        else
+            log_warning "IP NÃO MUDOU (operadora pode ter mantido)"
+        fi
+        log_info "========================================="
+        echo "Porta HTTP:    $TARGET_PORT"
+        echo "Porta SOCKS5:  $SOCKS_PORT"
+        echo "Modem:         $MODEM_ID"
+        echo "Interface:     $OLD_IFACE → $NEW_IFACE"
+        echo "IP interno:    $OLD_IP → $NEW_IP"
+        echo "IP público:    $OLD_PUBLIC_IP → $NEW_PUBLIC_IP"
+        log_info "========================================="
+        
+        return 0
+    done
+    
+    # Se chegou aqui, todas as tentativas falharam
+    echo ""
+    log_info "========================================="
+    log_error "FALHA AO RENOVAR IP"
+    log_info "========================================="
+    echo "Tentativas: $MAX_ATTEMPTS"
+    echo "Porta: $TARGET_PORT"
+    echo ""
+    echo "Possíveis causas:"
+    echo "- Operadora mantém IP por período mínimo"
+    echo "- CGNAT com pool limitado"
+    echo "- Necessário aguardar mais tempo"
+    log_info "========================================="
+    
+    return 1
+}
+
+# ============================================================================
+# STATUS DO SISTEMA
+# ============================================================================
+
 show_status() {
-    echo "========================================="
-    echo "STATUS DO SISTEMA"
-    echo "========================================="
+    echo ""
+    log_info "========================================="
+    log_info "STATUS DO SISTEMA"
+    log_info "========================================="
     echo ""
     
     # Modems
-    echo "📱 MODEMS:"
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2)
-    for M in $MODEMS; do
-        STATE=$(mmcli -m $M 2>/dev/null | grep "state:" | awk '{print $3}')
-        SIGNAL=$(mmcli -m $M 2>/dev/null | grep "signal quality" | awk '{print $4}')
-        echo "  Modem $M: $STATE (Sinal: $SIGNAL)"
-    done
+    echo "📱 MODEMS DETECTADOS:"
+    local MODEM_LIST=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]\+" | cut -d'/' -f2 | sort -n)
     
-    echo ""
-    
-    # 3proxy
-    if pgrep 3proxy > /dev/null 2>&1; then
-        echo "🔧 3PROXY: ✅ RODANDO"
-        echo ""
-        echo "🌐 IPs PÚBLICOS:"
-        
-        for PORT in 6001 6002 6003 6004 6005; do
-            if netstat -tlnp 2>/dev/null | grep -q ":$PORT "; then
-                # Descobrir qual IP do modem está na porta
-                MODEM_IP=$(netstat -tlnp 2>/dev/null | grep ":$PORT " | awk '{print $4}' | cut -d: -f1 | head -1)
-                if [ -n "$MODEM_IP" ] && [ "$MODEM_IP" != "0.0.0.0" ]; then
-                    PUBLIC_IP=$(timeout 5 curl -s --interface $(ip addr | grep "$MODEM_IP" | awk '{print $NF}') https://api.ipify.org 2>/dev/null)
-                    if [ -n "$PUBLIC_IP" ]; then
-                        echo "  Porta $PORT ($MODEM_IP): $PUBLIC_IP"
-                    fi
-                fi
-            fi
-        done
+    if [ -z "$MODEM_LIST" ]; then
+        echo "  Nenhum modem detectado"
     else
-        echo "🔧 3PROXY: ❌ PARADO"
+        for MODEM_ID in $MODEM_LIST; do
+            local STATE=$(mmcli -m "$MODEM_ID" 2>/dev/null | grep -oP "state: \K.*" | head -1 || echo "unknown")
+            local SIGNAL=$(mmcli -m "$MODEM_ID" 2>/dev/null | grep -oP "signal quality: \K[0-9]+" || echo "N/A")
+            
+            local BEARER=$(mmcli -m "$MODEM_ID" 2>/dev/null | grep "Bearer.*paths" | tail -1 | awk -F'/' '{print $NF}')
+            local IFACE="N/A"
+            local IP="N/A"
+            
+            if [ -n "$BEARER" ]; then
+                IFACE=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "interface:" | awk '{print $3}' || echo "N/A")
+                IP=$(mmcli -b "$BEARER" 2>/dev/null | grep -w "address:" | awk '{print $3}' || echo "N/A")
+            fi
+            
+            printf "  [%2s] Estado: %-12s | Sinal: %3s%% | Interface: %-6s | IP: %s\n" \
+                "$MODEM_ID" "$STATE" "$SIGNAL" "$IFACE" "$IP"
+        done
     fi
     
     echo ""
-    echo "========================================="
-}
-
-# Parar sistema
-stop_system() {
-    echo "🛑 Parando sistema..."
-    killall 3proxy 2>/dev/null || true
-    MODEMS=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]" | cut -d'/' -f2)
-    for M in $MODEMS; do
-        mmcli -m $M --simple-disconnect 2>/dev/null || true
+    echo "🔧 INSTÂNCIAS 3PROXY:"
+    
+    local proxy_count=0
+    for PORT in $(seq $((BASE_PROXY_PORT + 1)) $((BASE_PROXY_PORT + MAX_MODEMS))); do
+        local PID_FILE="${PID_DIR}/3proxy_${PORT}.pid"
+        
+        if [ -f "$PID_FILE" ]; then
+            local PID=$(cat "$PID_FILE" 2>/dev/null)
+            
+            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                # Buscar IP da config
+                local CONFIG_FILE="${CONFIG_DIR}/3proxy_${PORT}.cfg"
+                local PROXY_IP="N/A"
+                
+                if [ -f "$CONFIG_FILE" ]; then
+                    PROXY_IP=$(grep -oP "proxy.*-e\K[0-9.]+" "$CONFIG_FILE" 2>/dev/null || echo "N/A")
+                fi
+                
+                # Tentar obter IP público
+                local PUBLIC_IP=$(timeout 5 curl -s -x "http://127.0.0.1:${PORT}" https://api.ipify.org 2>/dev/null || echo "N/A")
+                
+                printf "  HTTP:%-5d SOCKS:%-5d | IP interno: %-15s | IP público: %s | PID: %s\n" \
+                    "$PORT" "$((PORT + 1000))" "$PROXY_IP" "$PUBLIC_IP" "$PID"
+                
+                proxy_count=$((proxy_count + 1))
+            fi
+        fi
     done
-    echo "✅ Sistema parado"
+    
+    if [ $proxy_count -eq 0 ]; then
+        echo "  Nenhuma instância rodando"
+    fi
+    
+    echo ""
+    echo "💾 STATUS FILE: $STATUS_FILE"
+    if [ -f "$STATUS_FILE" ]; then
+        echo "  Última atualização: $(stat -c %y "$STATUS_FILE" 2>/dev/null | cut -d. -f1)"
+    else
+        echo "  Arquivo não encontrado"
+    fi
+    
+    echo ""
+    log_info "========================================="
 }
 
-# Menu principal
-case "$1" in
-    start)
-        if detect_all_modems; then
-            setup_system
+# ============================================================================
+# PARAR SISTEMA
+# ============================================================================
+
+stop_system() {
+    log_info "Parando sistema..."
+    
+    # Parar todas as instâncias do 3proxy
+    log_info "Parando instâncias 3proxy..."
+    local stopped=0
+    
+    for PORT in $(seq $((BASE_PROXY_PORT + 1)) $((BASE_PROXY_PORT + MAX_MODEMS))); do
+        local PID_FILE="${PID_DIR}/3proxy_${PORT}.pid"
+        
+        if [ -f "$PID_FILE" ]; then
+            local PID=$(cat "$PID_FILE" 2>/dev/null)
+            
+            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                kill "$PID" 2>/dev/null || true
+                rm -f "$PID_FILE"
+                stopped=$((stopped + 1))
+            fi
         fi
-        ;;
-    stop)
-        stop_system
-        ;;
-    restart)
-        stop_system
-        sleep 3
-        if detect_all_modems; then
-            setup_system
-        fi
-        ;;
-    renew-port)
-        if [ -z "$2" ]; then
-            echo "Uso: $0 renew-port <PORTA>"
-            echo "Exemplo: $0 renew-port 6001"
+    done
+    
+    # Fallback: killall
+    killall 3proxy 2>/dev/null || true
+    
+    log_success "Instâncias 3proxy paradas: $stopped"
+    
+    # Desconectar modems
+    log_info "Desconectando modems..."
+    local MODEM_LIST=$(mmcli -L 2>/dev/null | grep -o "Modem/[0-9]\+" | cut -d'/' -f2)
+    
+    for MODEM_ID in $MODEM_LIST; do
+        mmcli -m "$MODEM_ID" --simple-disconnect 2>/dev/null || true
+    done
+    
+    log_success "Sistema parado"
+}
+
+# ============================================================================
+# INICIAR SISTEMA
+# ============================================================================
+
+start_system() {
+    check_root
+    create_directories
+    
+    echo ""
+    log_info "========================================="
+    log_info "INICIANDO SISTEMA MULTI-MODEM"
+    log_info "========================================="
+    echo ""
+    
+    # Detectar modems
+    if ! detect_all_modems; then
+        log_error "Falha ao detectar modems"
+        return 1
+    fi
+    
+    echo ""
+    
+    # Configurar roteamento
+    setup_routing
+    
+    echo ""
+    
+    # Configurar proxies
+    setup_all_proxies
+    
+    echo ""
+    
+    # Salvar status
+    save_status
+    
+    echo ""
+    log_info "========================================="
+    log_success "SISTEMA INICIADO COM SUCESSO!"
+    log_info "========================================="
+    echo ""
+    echo "📊 RESUMO:"
+    echo "  Modems funcionais: ${#DETECTED_MODEMS[@]}"
+    echo "  Portas HTTP: $((BASE_PROXY_PORT + 1)) - $((BASE_PROXY_PORT + ${#DETECTED_MODEMS[@]}))"
+    echo "  Portas SOCKS5: $((BASE_SOCKS_PORT + 1)) - $((BASE_SOCKS_PORT + ${#DETECTED_MODEMS[@]}))"
+    echo ""
+    echo "🌐 API Dashboard: http://SEU_IP:5000"
+    echo ""
+    log_info "========================================="
+}
+
+# ============================================================================
+# REINICIAR SISTEMA
+# ============================================================================
+
+restart_system() {
+    stop_system
+    sleep 3
+    start_system
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    case "${1:-}" in
+        start)
+            start_system
+            ;;
+        stop)
+            check_root
+            stop_system
+            ;;
+        restart)
+            check_root
+            restart_system
+            ;;
+        status)
+            show_status
+            ;;
+        renew-port)
+            check_root
+            if [ -z "${2:-}" ]; then
+                log_error "Uso: $0 renew-port <PORTA>"
+                log_error "Exemplo: $0 renew-port 6001"
+                exit 1
+            fi
+            renew_ip_by_port "$2"
+            ;;
+        *)
+            echo "Uso: $0 {start|stop|restart|status|renew-port PORT}"
+            echo ""
+            echo "Comandos:"
+            echo "  start           - Inicia o sistema"
+            echo "  stop            - Para o sistema"
+            echo "  restart         - Reinicia o sistema completo"
+            echo "  status          - Mostra status detalhado"
+            echo "  renew-port PORT - Renova IP de porta específica"
+            echo ""
+            echo "Exemplos:"
+            echo "  $0 start"
+            echo "  $0 renew-port 6001"
+            echo "  $0 status"
             exit 1
-        fi
-        renew_by_port $2
-        ;;
-    status)
-        show_status
-        ;;
-    *)
-        echo "Uso: $0 {start|stop|restart|renew-port PORT|status}"
-        echo ""
-        echo "Comandos:"
-        echo "  start           - Inicia sistema"
-        echo "  stop            - Para sistema"
-        echo "  restart         - Reinicia sistema completo"
-        echo "  renew-port PORT - Renova IP de porta específica (ex: 6001)"
-        echo "  status          - Mostra status"
-        exit 1
-        ;;
-esac
+            ;;
+    esac
+}
+
+main "$@"
