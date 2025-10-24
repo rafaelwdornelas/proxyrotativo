@@ -29,7 +29,7 @@ declare -a DETECTED_IPS=()
 declare -a DETECTED_GATEWAYS=()
 declare -a DETECTED_PREFIXES=()
 declare -a DETECTED_PORTS=()
-
+MODEM_INDEX=""  # ← ADICIONAR ESTA LINHA
 # ============================================================================
 # FUNÇÕES AUXILIARES
 # ============================================================================
@@ -366,12 +366,83 @@ save_status() {
 # RENOVAÇÃO DE IP POR PORTA
 # ============================================================================
 
+load_status_file() {
+    if [ ! -f "$STATUS_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Arquivo de status não encontrado: $STATUS_FILE" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Execute 'start' primeiro para gerar o arquivo de status" >&2
+        return 1
+    fi
+    
+    # Limpar arrays
+    DETECTED_MODEMS=()
+    DETECTED_INTERFACES=()
+    DETECTED_IPS=()
+    DETECTED_GATEWAYS=()
+    DETECTED_PREFIXES=()
+    DETECTED_PORTS=()
+    
+    # Ler JSON usando jq
+    local modem_count
+    modem_count=$(jq -r '.modem_count' "$STATUS_FILE" 2>/dev/null || echo "0")
+    
+    if [ "$modem_count" -eq 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Nenhum modem encontrado no arquivo de status" >&2
+        return 1
+    fi
+    
+    # Carregar dados de cada modem
+    local i
+    for i in $(seq 0 $((modem_count - 1))); do
+        local modem_id
+        local interface
+        local ip
+        local gateway
+        local http_port
+        local prefix
+        
+        modem_id=$(jq -r ".modems[$i].id" "$STATUS_FILE" 2>/dev/null)
+        interface=$(jq -r ".modems[$i].interface" "$STATUS_FILE" 2>/dev/null)
+        ip=$(jq -r ".modems[$i].ip" "$STATUS_FILE" 2>/dev/null)
+        gateway=$(jq -r ".modems[$i].gateway" "$STATUS_FILE" 2>/dev/null)
+        http_port=$(jq -r ".modems[$i].http_port" "$STATUS_FILE" 2>/dev/null)
+        
+        # Prefix padrão
+        prefix="24"
+        
+        DETECTED_MODEMS+=("$modem_id")
+        DETECTED_INTERFACES+=("$interface")
+        DETECTED_IPS+=("$ip")
+        DETECTED_GATEWAYS+=("$gateway")
+        DETECTED_PREFIXES+=("$prefix")
+        DETECTED_PORTS+=("$http_port")
+    done
+    
+    # Log após carregar tudo - TUDO para stderr
+    local total_loaded
+    total_loaded=${#DETECTED_MODEMS[@]}
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ℹ️  Status carregado: $total_loaded modems" >&2
+    
+    return 0
+}
+
 find_modem_by_port() {
     local TARGET_PORT=$1
     
+    # Variável global para retorno
+    MODEM_INDEX=""
+    
+    # Carregar status se arrays estiverem vazios
+    if [ ${#DETECTED_PORTS[@]} -eq 0 ]; then
+        load_status_file
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+    fi
+    
+    # Procurar porta
     for i in "${!DETECTED_PORTS[@]}"; do
         if [ "${DETECTED_PORTS[$i]}" -eq "$TARGET_PORT" ]; then
-            echo "$i"
+            MODEM_INDEX="$i"
             return 0
         fi
     done
@@ -391,10 +462,19 @@ renew_ip_by_port() {
     log_info "Renovando IP da porta $TARGET_PORT"
     log_info "========================================="
     
-    # Buscar índice do modem
-    local MODEM_INDEX
-    if ! MODEM_INDEX=$(find_modem_by_port "$TARGET_PORT"); then
+   # Buscar índice do modem (usa variável global MODEM_INDEX)
+    find_modem_by_port "$TARGET_PORT"
+    
+    if [ $? -ne 0 ] || [ -z "$MODEM_INDEX" ]; then
         log_error "Porta $TARGET_PORT não encontrada no sistema"
+        
+        if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
+            log_error "Portas disponíveis:"
+            for i in "${!DETECTED_PORTS[@]}"; do
+                log_error "  - Porta ${DETECTED_PORTS[$i]} (Modem ${DETECTED_MODEMS[$i]})"
+            done
+        fi
+        
         return 1
     fi
     
