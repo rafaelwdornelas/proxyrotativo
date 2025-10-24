@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Manager v2.0 + SMS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes slideIn {
+            from {
+                transform: translateY(-100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+        
+        .toast {
+            animation: slideIn 0.3s ease-out;
+        }
+
+        .loading {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3b82f6;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .tab-active {
+            border-bottom: 2px solid #3b82f6;
+            color: #3b82f6;
+        }
+
+        .sms-item {
+            transition: all 0.3s ease;
+        }
+
+        .sms-item:hover {
+            background-color: #f9fafb;
+            transform: translateX(4px);
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <!-- Toast Notification -->
+    <div id="toast" class="fixed top-4 right-4 z-50 hidden">
+        <div class="bg-white rounded-lg shadow-lg p-4 max-w-md border-l-4" id="toast-content">
+            <div class="flex items-center">
+                <span id="toast-icon" class="mr-3"></span>
+                <p id="toast-message" class="text-sm font-medium"></p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="bg-white shadow-sm border-b">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <div class="bg-blue-500 rounded-lg p-2">
+                        <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="text-2xl font-bold text-gray-900">Proxy Manager</h1>
+                        <p class="text-sm text-gray-500">v2.0 + SMS System</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2">
+                        <div class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                        <span class="text-sm text-gray-600">Online</span>
+                    </div>
+                    <button onclick="refreshData()" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center space-x-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                        <span>Atualizar</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Tabs -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+        <div class="border-b border-gray-200">
+            <nav class="flex space-x-8">
+                <button onclick="switchTab('proxies')" id="tab-proxies" class="tab-active py-4 px-1 border-b-2 font-medium text-sm">
+                    🔧 Proxies
+                </button>
+                <button onclick="switchTab('sms')" id="tab-sms" class="py-4 px-1 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-700 hover:border-gray-300">
+                    📱 SMS
+                </button>
+            </nav>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        
+        <!-- ============================================================================ -->
+        <!-- TAB: PROXIES -->
+        <!-- ============================================================================ -->
+        <div id="content-proxies" class="space-y-6">
+            <!-- Stats Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">Modems Ativos</p>
+                            <p id="modem-count" class="text-3xl font-bold text-gray-900">-</p>
+                        </div>
+                        <div class="bg-blue-100 rounded-full p-3">
+                            <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">Proxies Online</p>
+                            <p id="proxy-count" class="text-3xl font-bold text-gray-900">-</p>
+                        </div>
+                        <div class="bg-green-100 rounded-full p-3">
+                            <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">Uptime</p>
+                            <p id="uptime" class="text-2xl font-bold text-gray-900">-</p>
+                        </div>
+                        <div class="bg-purple-100 rounded-full p-3">
+                            <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">Última Atualização</p>
+                            <p id="last-update" class="text-sm font-medium text-gray-900">-</p>
+                        </div>
+                        <div class="bg-yellow-100 rounded-full p-3">
+                            <svg class="w-6 h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Proxies Grid -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-gray-900">Lista de Proxies</h2>
+                    <button onclick="restartSystem()" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg flex items-center space-x-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                        <span>Reiniciar Sistema</span>
+                    </button>
+                </div>
+                <div id="proxies-container" class="divide-y divide-gray-200">
+                    <div class="p-8 text-center text-gray-500">
+                        <div class="loading mx-auto mb-4"></div>
+                        <p>Carregando proxies...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modems List -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">Modems Detectados</h2>
+                </div>
+                <div id="modems-container" class="divide-y divide-gray-200">
+                    <div class="p-8 text-center text-gray-500">
+                        <div class="loading mx-auto mb-4"></div>
+                        <p>Carregando modems...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================================ -->
+        <!-- TAB: SMS -->
+        <!-- ============================================================================ -->
+        <div id="content-sms" class="space-y-6 hidden">
+            
+            <!-- SMS Stats -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">SMS no Histórico</p>
+                            <p id="sms-history-count" class="text-3xl font-bold text-gray-900">0</p>
+                        </div>
+                        <div class="bg-blue-100 rounded-full p-3">
+                            📥
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">SMS Não Lidos</p>
+                            <p id="sms-unread-count" class="text-3xl font-bold text-gray-900">0</p>
+                        </div>
+                        <div class="bg-green-100 rounded-full p-3">
+                            ✉️
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-600">Polling Ativo</p>
+                            <p class="text-2xl font-bold text-green-600">🟢 10s</p>
+                        </div>
+                        <div class="bg-purple-100 rounded-full p-3">
+                            🔄
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Send SMS Form -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">📤 Enviar SMS</h2>
+                </div>
+                <div class="p-6">
+                    <form onsubmit="sendSMS(event)" class="space-y-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Modem</label>
+                                <select id="sms-modem" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                                    <option value="">Selecione um modem...</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Número (com DDD)</label>
+                                <input type="text" id="sms-number" required placeholder="+5535998919311" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Mensagem</label>
+                            <textarea id="sms-text" required rows="3" placeholder="Digite sua mensagem..." class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"></textarea>
+                            <p class="text-sm text-gray-500 mt-1">Comandos: RENEW &lt;porta&gt; | STATUS | HELP</p>
+                        </div>
+                        <button type="submit" class="w-full bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 rounded-lg flex items-center justify-center space-x-2 transition">
+                            <span>📤 Enviar SMS</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- SMS History -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-gray-900">📜 Histórico de SMS Recebidos</h2>
+                    <button onclick="refreshSMS()" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center space-x-2 transition text-sm">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                        <span>Atualizar</span>
+                    </button>
+                </div>
+                <div id="sms-history-container" class="divide-y divide-gray-200 max-h-[600px] overflow-y-auto">
+                    <div class="p-8 text-center text-gray-500">
+                        <div class="loading mx-auto mb-4"></div>
+                        <p>Carregando histórico...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Current SMS Inbox -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-gray-900">📨 SMS Atuais (na Memória dos Modems)</h2>
+                    <button onclick="clearAllSMS()" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg flex items-center space-x-2 transition text-sm">
+                        <span>🗑️ Limpar Todos</span>
+                    </button>
+                </div>
+                <div id="sms-inbox-container" class="divide-y divide-gray-200">
+                    <div class="p-8 text-center text-gray-500">
+                        <p>Nenhum SMS na memória dos modems</p>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </main>
+
+    <script>
+        let autoRefreshInterval;
+
+        // ============================================================================
+        // INICIALIZAÇÃO
+        // ============================================================================
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshData();
+            startAutoRefresh();
+        });
+
+        // ============================================================================
+        // TAB SWITCHING
+        // ============================================================================
+
+        function switchTab(tab) {
+            // Update tab buttons
+            document.querySelectorAll('[id^="tab-"]').forEach(btn => {
+                btn.classList.remove('tab-active', 'text-blue-600');
+                btn.classList.add('text-gray-500', 'border-transparent');
+            });
+            
+            document.getElementById(`tab-${tab}`).classList.add('tab-active', 'text-blue-600');
+            document.getElementById(`tab-${tab}`).classList.remove('text-gray-500', 'border-transparent');
+
+            // Update content
+            document.querySelectorAll('[id^="content-"]').forEach(content => {
+                content.classList.add('hidden');
+            });
+            
+            document.getElementById(`content-${tab}`).classList.remove('hidden');
+
+            // Load tab-specific data
+            if (tab === 'sms') {
+                loadSMSData();
+            } else if (tab === 'proxies') {
+                refreshData();
+            }
+        }
+
+        // ============================================================================
+        // PROXIES TAB
+        // ============================================================================
+
+        async function refreshData() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+
+                if (data.success) {
+                    updateStats(data.data.system);
+                    updateProxies(data.data.proxies);
+                    updateModems(data.data.modems);
+                }
+            } catch (error) {
+                console.error('Erro ao carregar dados:', error);
+                showToast('Erro ao carregar dados', 'error');
+            }
+        }
+
+        function updateStats(system) {
+            document.getElementById('modem-count').textContent = system.modem_count || 0;
+            document.getElementById('proxy-count').textContent = system.proxies_running || 0;
+            document.getElementById('uptime').textContent = system.uptime || 'N/A';
+            document.getElementById('last-update').textContent = system.last_update || 'N/A';
+        }
+
+        function updateProxies(proxies) {
+            const container = document.getElementById('proxies-container');
+            
+            if (!proxies || proxies.length === 0) {
+                container.innerHTML = '<div class="p-8 text-center text-gray-500">Nenhum proxy ativo</div>';
+                return;
+            }
+
+            const httpProxies = proxies.filter(p => p.protocol === 'HTTP');
+            
+            container.innerHTML = httpProxies.map(proxy => {
+                const statusColor = proxy.running ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800';
+                const statusIcon = proxy.running ? '✓' : '✗';
+                
+                return `
+                    <div class="p-6 hover:bg-gray-50 transition">
+                        <div class="flex items-center justify-between">
+                            <div class="flex-1">
+                                <div class="flex items-center space-x-3">
+                                    <span class="px-3 py-1 ${statusColor} rounded-full text-sm font-medium">
+                                        ${statusIcon} ${proxy.running ? 'Online' : 'Offline'}
+                                    </span>
+                                    <span class="text-lg font-semibold text-gray-900">Porta ${proxy.port}</span>
+                                    <span class="text-sm text-gray-500">${proxy.modem}</span>
+                                </div>
+                                <div class="mt-2 flex items-center space-x-6 text-sm text-gray-600">
+                                    <span>🌐 IP: <code class="bg-gray-100 px-2 py-1 rounded">${proxy.public_ip}</code></span>
+                                    <span>📡 HTTP + SOCKS5 (${proxy.port + 1000})</span>
+                                </div>
+                            </div>
+                            <button onclick="renewPort(${proxy.port})" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg transition flex items-center space-x-2">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                                </svg>
+                                <span>Renovar IP</span>
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateModems(modems) {
+            const container = document.getElementById('modems-container');
+            
+            if (!modems || modems.length === 0) {
+                container.innerHTML = '<div class="p-8 text-center text-gray-500">Nenhum modem detectado</div>';
+                return;
+            }
+
+            container.innerHTML = modems.map(modem => {
+                const stateColor = modem.state === 'connected' ? 'text-green-600' : 'text-yellow-600';
+                
+                return `
+                    <div class="p-6 hover:bg-gray-50 transition">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center space-x-4">
+                                <div class="bg-blue-100 rounded-full p-3">
+                                    <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h3 class="font-semibold text-gray-900">Modem ${modem.id}</h3>
+                                    <p class="text-sm text-gray-600">Interface: ${modem.interface || 'N/A'}</p>
+                                </div>
+                            </div>
+                            <div class="text-right space-y-1">
+                                <p class="text-sm ${stateColor} font-medium">● ${modem.state || 'unknown'}</p>
+                                <p class="text-sm text-gray-600">Sinal: ${modem.signal || 'N/A'}</p>
+                                <p class="text-xs text-gray-500">IP: ${modem.internal_ip || 'N/A'}</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function renewPort(port) {
+            if (!confirm(`Renovar IP da porta ${port}? Isso levará ~45 segundos.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/renew', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ port: port })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast(`✅ ${data.message}`, 'success');
+                    setTimeout(refreshData, 45000);
+                } else {
+                    showToast(`❌ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showToast('Erro ao renovar IP', 'error');
+            }
+        }
+
+        async function restartSystem() {
+            if (!confirm('Reiniciar o sistema completo? Todos os proxies serão reiniciados.')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/restart', {
+                    method: 'POST'
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('✅ Sistema será reiniciado em breve', 'success');
+                    setTimeout(refreshData, 60000);
+                } else {
+                    showToast('❌ Erro ao reiniciar sistema', 'error');
+                }
+            } catch (error) {
+                showToast('Erro ao reiniciar sistema', 'error');
+            }
+        }
+
+        // ============================================================================
+        // SMS TAB
+        // ============================================================================
+
+        async function loadSMSData() {
+            await Promise.all([
+                loadSMSHistory(),
+                loadSMSInbox(),
+                loadModemsList()
+            ]);
+        }
+
+        async function loadSMSHistory() {
+            try {
+                const response = await fetch('/sms/history');
+                const data = await response.json();
+
+                if (data.success) {
+                    const smsArray = data.data.sms || [];
+                    document.getElementById('sms-history-count').textContent = smsArray.length;
+                    updateSMSHistory(smsArray);
+                }
+            } catch (error) {
+                console.error('Erro ao carregar histórico SMS:', error);
+            }
+        }
+
+        async function loadSMSInbox() {
+            try {
+                const response = await fetch('/sms/inbox');
+                const data = await response.json();
+
+                if (data.success) {
+                    updateSMSInbox(data.data);
+                }
+            } catch (error) {
+                console.error('Erro ao carregar inbox SMS:', error);
+            }
+        }
+
+        async function loadModemsList() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+
+                if (data.success && data.data.modems) {
+                    const select = document.getElementById('sms-modem');
+                    select.innerHTML = '<option value="">Selecione um modem...</option>' + 
+                        data.data.modems.map(m => 
+                            `<option value="${m.id}">Modem ${m.id} (${m.interface || 'N/A'})</option>`
+                        ).join('');
+                }
+            } catch (error) {
+                console.error('Erro ao carregar modems:', error);
+            }
+        }
+
+        function updateSMSHistory(smsArray) {
+            const container = document.getElementById('sms-history-container');
+
+            if (!smsArray || smsArray.length === 0) {
+                container.innerHTML = '<div class="p-8 text-center text-gray-500">Nenhum SMS no histórico</div>';
+                return;
+            }
+
+            // Ordenar por data (mais recente primeiro)
+            smsArray.sort((a, b) => new Date(b.received) - new Date(a.received));
+
+            container.innerHTML = smsArray.map(sms => {
+                const date = new Date(sms.received).toLocaleString('pt-BR');
+                
+                return `
+                    <div class="p-4 sms-item">
+                        <div class="flex items-start space-x-4">
+                            <div class="flex-shrink-0">
+                                <div class="bg-blue-100 rounded-full p-2">
+                                    📱
+                                </div>
+                            </div>
+                            <div class="flex-1 min-w-0">
+                                <div class="flex items-center justify-between mb-1">
+                                    <p class="text-sm font-medium text-gray-900">De: ${sms.number}</p>
+                                    <span class="text-xs text-gray-500">Modem ${sms.modem_id}</span>
+                                </div>
+                                <p class="text-sm text-gray-700 mb-1">${escapeHtml(sms.text)}</p>
+                                <p class="text-xs text-gray-500">${date}</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateSMSInbox(inboxData) {
+            const container = document.getElementById('sms-inbox-container');
+            let totalSMS = 0;
+            let html = '';
+
+            for (const [modemId, smsList] of Object.entries(inboxData)) {
+                if (smsList && smsList.length > 0) {
+                    totalSMS += smsList.length;
+                    
+                    html += `
+                        <div class="p-4 bg-gray-50">
+                            <h3 class="font-semibold text-gray-900 mb-2">📱 Modem ${modemId} (${smsList.length} SMS)</h3>
+                        </div>
+                    `;
+
+                    smsList.forEach(sms => {
+                        html += `
+                            <div class="p-4 hover:bg-gray-50">
+                                <div class="flex items-start justify-between">
+                                    <div class="flex-1">
+                                        <p class="text-sm font-medium text-gray-900">De: ${sms.number}</p>
+                                        <p class="text-sm text-gray-700 mt-1">${escapeHtml(sms.text)}</p>
+                                        <p class="text-xs text-gray-500 mt-1">${sms.timestamp}</p>
+                                    </div>
+                                    <button onclick="deleteSMS('${modemId}', '${sms.id}')" class="ml-4 text-red-600 hover:text-red-800">
+                                        🗑️
+                                    </button>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+            }
+
+            document.getElementById('sms-unread-count').textContent = totalSMS;
+
+            if (html === '') {
+                container.innerHTML = '<div class="p-8 text-center text-gray-500">Nenhum SMS na memória dos modems</div>';
+            } else {
+                container.innerHTML = html;
+            }
+        }
+
+        async function sendSMS(event) {
+            event.preventDefault();
+
+            const modemId = document.getElementById('sms-modem').value;
+            const number = document.getElementById('sms-number').value;
+            const text = document.getElementById('sms-text').value;
+
+            if (!modemId || !number || !text) {
+                showToast('Preencha todos os campos', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/sms/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        modem_id: modemId,
+                        number: number,
+                        text: text
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('✅ SMS enviado com sucesso!', 'success');
+                    document.getElementById('sms-text').value = '';
+                    setTimeout(loadSMSHistory, 2000);
+                } else {
+                    showToast(`❌ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showToast('Erro ao enviar SMS', 'error');
+            }
+        }
+
+        async function deleteSMS(modemId, smsId) {
+            if (!confirm('Apagar este SMS?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/sms/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        modem_id: modemId,
+                        sms_id: smsId
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('✅ SMS apagado', 'success');
+                    loadSMSInbox();
+                } else {
+                    showToast(`❌ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showToast('Erro ao apagar SMS', 'error');
+            }
+        }
+
+        async function clearAllSMS() {
+            if (!confirm('Apagar TODOS os SMS de todos os modems?')) {
+                return;
+            }
+
+            try {
+                const inboxResponse = await fetch('/sms/inbox');
+                const inboxData = await inboxResponse.json();
+
+                if (!inboxData.success) {
+                    showToast('Erro ao carregar SMS', 'error');
+                    return;
+                }
+
+                let deleted = 0;
+
+                for (const [modemId, smsList] of Object.entries(inboxData.data)) {
+                    if (smsList && smsList.length > 0) {
+                        for (const sms of smsList) {
+                            await fetch('/sms/delete', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    modem_id: modemId,
+                                    sms_id: sms.id
+                                })
+                            });
+                            deleted++;
+                        }
+                    }
+                }
+
+                showToast(`✅ ${deleted} SMS apagados`, 'success');
+                loadSMSInbox();
+            } catch (error) {
+                showToast('Erro ao apagar SMS', 'error');
+            }
+        }
+
+        async function refreshSMS() {
+            await loadSMSData();
+            showToast('✅ SMS atualizados', 'success');
+        }
+
+        // ============================================================================
+        // UTILIDADES
+        // ============================================================================
+
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            const toastContent = document.getElementById('toast-content');
+            const toastMessage = document.getElementById('toast-message');
+            const toastIcon = document.getElementById('toast-icon');
+
+            const colors = {
+                success: { border: 'border-green-500', icon: '✓', iconBg: 'bg-green-100 text-green-600' },
+                error: { border: 'border-red-500', icon: '✗', iconBg: 'bg-red-100 text-red-600' },
+                info: { border: 'border-blue-500', icon: 'ℹ', iconBg: 'bg-blue-100 text-blue-600' }
+            };
+
+            const style = colors[type] || colors.info;
+
+            toastContent.className = `bg-white rounded-lg shadow-lg p-4 max-w-md border-l-4 ${style.border}`;
+            toastIcon.className = `flex items-center justify-center w-8 h-8 rounded-full ${style.iconBg} mr-3`;
+            toastIcon.textContent = style.icon;
+            toastMessage.textContent = message;
+
+            toast.classList.remove('hidden');
+
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 4000);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function startAutoRefresh() {
+            autoRefreshInterval = setInterval(() => {
+                const activeTab = document.querySelector('.tab-active').id.replace('tab-', '');
+                
+                if (activeTab === 'proxies') {
+                    refreshData();
+                } else if (activeTab === 'sms') {
+                    loadSMSHistory();
+                    loadSMSInbox();
+                }
+            }, 30000); // 30 segundos
+        }
+    </script>
+</body>
+</html>
