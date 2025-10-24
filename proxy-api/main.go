@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -10,31 +11,34 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-var SCRIPT_PATH = func() string {
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/root"
-	}
-	path := home + "/proxy-system/proxy-manager.sh"
-	log.Printf("Script path configurado: %s", path)
-	return path
-}()
+// ============================================================================
+// CONFIGURAÇÕES
+// ============================================================================
 
-const (
-	PORT = ":5000"
+var (
+	SCRIPT_PATH      = getScriptPath()
+	PORT             = ":5000"
+	BASE_PROXY_PORT  = 6000
+	BASE_SOCKS_PORT  = 7000
+	MAX_MODEMS       = 100
+	STATUS_FILE      = "/var/run/proxy-status.json"
+	IP_CHECK_TIMEOUT = 8 * time.Second
 )
 
-// Response padrão
+// ============================================================================
+// ESTRUTURAS DE DADOS
+// ============================================================================
+
 type Response struct {
 	Success bool        `json:"success"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// Status completo
 type StatusResponse struct {
 	Modems  []ModemInfo `json:"modems"`
 	Proxies []ProxyInfo `json:"proxies"`
@@ -54,26 +58,73 @@ type ProxyInfo struct {
 	PublicIP string `json:"public_ip"`
 	Protocol string `json:"protocol"`
 	Modem    string `json:"modem"`
+	Running  bool   `json:"running"`
 }
 
 type SystemInfo struct {
-	Proxy3Running bool   `json:"proxy3_running"`
-	ModemCount    int    `json:"modem_count"`
-	Uptime        string `json:"uptime"`
+	ProxiesRunning int    `json:"proxies_running"`
+	ModemCount     int    `json:"modem_count"`
+	Uptime         string `json:"uptime"`
+	LastUpdate     string `json:"last_update"`
 }
 
 type RenewRequest struct {
 	Port int `json:"port"`
 }
 
-// Executar comando shell
+type SavedStatus struct {
+	Timestamp  string           `json:"timestamp"`
+	ModemCount int              `json:"modem_count"`
+	Modems     []SavedModemInfo `json:"modems"`
+}
+
+type SavedModemInfo struct {
+	ID        string `json:"id"`
+	Interface string `json:"interface"`
+	IP        string `json:"ip"`
+	Gateway   string `json:"gateway"`
+	HTTPPort  int    `json:"http_port"`
+	SocksPort int    `json:"socks_port"`
+}
+
+// Cache para IPs públicos
+var (
+	publicIPCache      = make(map[int]string)
+	publicIPCacheMutex sync.RWMutex
+	publicIPCacheTTL   = 30 * time.Second
+	publicIPCacheTime  = make(map[int]time.Time)
+)
+
+// ============================================================================
+// FUNÇÕES AUXILIARES
+// ============================================================================
+
+func getScriptPath() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/root"
+	}
+	path := home + "/proxy-system/proxy-manager.sh"
+	log.Printf("Script path: %s", path)
+	return path
+}
+
 func runCommand(command string, args ...string) (string, error) {
 	cmd := exec.Command(command, args...)
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
 
-// Middleware de logging
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// ============================================================================
+// MIDDLEWARES
+// ============================================================================
+
 func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -83,7 +134,6 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Middleware CORS
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -99,21 +149,486 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Responder com JSON
-func respondJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+// ============================================================================
+// HANDLERS
+// ============================================================================
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, Response{
+		Success: true,
+		Message: "API Proxy Manager está online",
+		Data: map[string]string{
+			"version":    "2.0.0",
+			"status":     "healthy",
+			"max_modems": fmt.Sprintf("%d", MAX_MODEMS),
+		},
+	})
 }
 
-// Dashboard HTML (Interface Web)
+func restartHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondJSON(w, http.StatusMethodNotAllowed, Response{
+			Success: false,
+			Message: "Método não permitido. Use POST",
+		})
+		return
+	}
+
+	log.Println("Recebida requisição de restart")
+
+	go func() {
+		output, err := runCommand("sudo", SCRIPT_PATH, "restart")
+		if err != nil {
+			log.Printf("Erro ao reiniciar: %v\nOutput: %s", err, output)
+		} else {
+			log.Println("Sistema reiniciado com sucesso")
+		}
+	}()
+
+	respondJSON(w, http.StatusOK, Response{
+		Success: true,
+		Message: "Comando de restart enviado. Sistema será reiniciado em alguns segundos.",
+	})
+}
+
+func renewPortHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondJSON(w, http.StatusMethodNotAllowed, Response{
+			Success: false,
+			Message: "Método não permitido. Use POST",
+		})
+		return
+	}
+
+	var req RenewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, Response{
+			Success: false,
+			Message: "JSON inválido: " + err.Error(),
+		})
+		return
+	}
+
+	minPort := BASE_PROXY_PORT + 1
+	maxPort := BASE_PROXY_PORT + MAX_MODEMS
+
+	if req.Port < minPort || req.Port > maxPort {
+		respondJSON(w, http.StatusBadRequest, Response{
+			Success: false,
+			Message: fmt.Sprintf("Porta inválida. Use portas entre %d e %d", minPort, maxPort),
+		})
+		return
+	}
+
+	log.Printf("Renovando IP da porta %d", req.Port)
+
+	// Responder imediatamente
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+
+	response := Response{
+		Success: true,
+		Message: "Renovação de IP iniciada. Aguarde ~45 segundos para conclusão.",
+		Data:    map[string]int{"port": req.Port},
+	}
+
+	json.NewEncoder(w).Encode(response)
+
+	// Forçar flush
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Executar em background
+	go func(port int) {
+		log.Printf("Iniciando renovação da porta %d em background", port)
+
+		// Limpar cache do IP público desta porta
+		publicIPCacheMutex.Lock()
+		delete(publicIPCache, port)
+		delete(publicIPCacheTime, port)
+		publicIPCacheMutex.Unlock()
+
+		output, err := runCommand("sudo", SCRIPT_PATH, "renew-port", strconv.Itoa(port))
+
+		if err != nil {
+			log.Printf("❌ Erro ao renovar porta %d: %v", port, err)
+			log.Printf("Output: %s", output)
+		} else {
+			if strings.Contains(output, "IP RENOVADO COM SUCESSO") {
+				log.Printf("✅ Porta %d renovada com sucesso", port)
+			} else if strings.Contains(output, "IP NÃO MUDOU") {
+				log.Printf("⚠️  Porta %d: IP não mudou (operadora manteve)", port)
+			} else {
+				log.Printf("⚠️  Porta %d: renovação concluída", port)
+			}
+		}
+
+		log.Printf("Renovação da porta %d finalizada", port)
+	}(req.Port)
+}
+
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondJSON(w, http.StatusMethodNotAllowed, Response{
+			Success: false,
+			Message: "Método não permitido. Use GET",
+		})
+		return
+	}
+
+	log.Println("Consultando status")
+
+	modems := getModemStatus()
+	proxies := getProxyStatus()
+	system := getSystemInfo()
+
+	respondJSON(w, http.StatusOK, Response{
+		Success: true,
+		Message: "Status obtido com sucesso",
+		Data: StatusResponse{
+			Modems:  modems,
+			Proxies: proxies,
+			System:  system,
+		},
+	})
+}
+
+// ============================================================================
+// OBTER STATUS DOS MODEMS
+// ============================================================================
+
+func getModemStatus() []ModemInfo {
+	output, err := runCommand("mmcli", "-L")
+	if err != nil {
+		log.Printf("Erro ao listar modems: %v", err)
+		return []ModemInfo{}
+	}
+
+	var modems []ModemInfo
+	lines := strings.Split(output, "\n")
+
+	for _, line := range lines {
+		if !strings.Contains(line, "Modem/") {
+			continue
+		}
+
+		// Extrair ID do modem
+		parts := strings.Split(line, "Modem/")
+		if len(parts) < 2 {
+			continue
+		}
+
+		idStr := ""
+		for _, ch := range parts[1] {
+			if ch >= '0' && ch <= '9' {
+				idStr += string(ch)
+			} else {
+				break
+			}
+		}
+
+		if idStr == "" {
+			continue
+		}
+
+		// Obter detalhes do modem
+		details, err := runCommand("mmcli", "-m", idStr)
+		if err != nil {
+			log.Printf("Erro ao obter detalhes do modem %s: %v", idStr, err)
+			continue
+		}
+
+		modem := ModemInfo{
+			ID:         idStr,
+			State:      "unknown",
+			Signal:     "N/A",
+			Interface:  "N/A",
+			InternalIP: "N/A",
+		}
+
+		// Parse do estado e sinal
+		for _, detailLine := range strings.Split(details, "\n") {
+			trimmed := strings.TrimSpace(detailLine)
+
+			// State
+			if strings.Contains(trimmed, "state:") && strings.Contains(trimmed, "|") {
+				parts := strings.Split(trimmed, "|")
+				if len(parts) >= 2 {
+					statePart := strings.TrimSpace(parts[1])
+					if strings.HasPrefix(statePart, "state:") {
+						modem.State = strings.TrimSpace(strings.TrimPrefix(statePart, "state:"))
+					}
+				}
+			}
+
+			// Signal
+			if strings.Contains(trimmed, "signal quality:") && strings.Contains(trimmed, "|") {
+				parts := strings.Split(trimmed, "|")
+				if len(parts) >= 2 {
+					signalPart := strings.TrimSpace(parts[1])
+					if strings.HasPrefix(signalPart, "signal quality:") {
+						signalValue := strings.TrimSpace(strings.TrimPrefix(signalPart, "signal quality:"))
+						if idx := strings.Index(signalValue, "%"); idx != -1 {
+							modem.Signal = strings.TrimSpace(signalValue[:idx+1])
+						}
+					}
+				}
+			}
+		}
+
+		// Obter Bearer
+		if strings.Contains(details, "Bearer") {
+			bearerLine := ""
+			for _, l := range strings.Split(details, "\n") {
+				if strings.Contains(l, "Bearer") && strings.Contains(l, "paths:") {
+					bearerLine = l
+					break
+				}
+			}
+
+			if bearerLine != "" {
+				parts := strings.Split(bearerLine, "/")
+				if len(parts) > 0 {
+					bearerID := strings.TrimSpace(parts[len(parts)-1])
+
+					bearerInfo, err := runCommand("mmcli", "-b", bearerID)
+					if err == nil {
+						for _, bLine := range strings.Split(bearerInfo, "\n") {
+							trimmed := strings.TrimSpace(bLine)
+
+							// Interface
+							if strings.Contains(trimmed, "interface:") && strings.Contains(trimmed, "|") {
+								parts := strings.Split(trimmed, "|")
+								if len(parts) >= 2 {
+									ifacePart := strings.TrimSpace(parts[1])
+									if strings.HasPrefix(ifacePart, "interface:") {
+										modem.Interface = strings.TrimSpace(strings.TrimPrefix(ifacePart, "interface:"))
+									}
+								}
+							}
+
+							// Address
+							if strings.Contains(trimmed, "address:") && strings.Contains(trimmed, "|") {
+								parts := strings.Split(trimmed, "|")
+								if len(parts) >= 2 {
+									addrPart := strings.TrimSpace(parts[1])
+									if strings.HasPrefix(addrPart, "address:") {
+										modem.InternalIP = strings.TrimSpace(strings.TrimPrefix(addrPart, "address:"))
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		modems = append(modems, modem)
+	}
+
+	if modems == nil {
+		return []ModemInfo{}
+	}
+
+	return modems
+}
+
+// ============================================================================
+// OBTER STATUS DOS PROXIES
+// ============================================================================
+
+func getProxyStatus() []ProxyInfo {
+	var proxies []ProxyInfo
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Carregar status salvo para saber quais portas verificar
+	savedStatus := loadSavedStatus()
+
+	// Se não houver status salvo, verificar range padrão
+	portsToCheck := []int{}
+
+	if savedStatus != nil && len(savedStatus.Modems) > 0 {
+		for _, modem := range savedStatus.Modems {
+			portsToCheck = append(portsToCheck, modem.HTTPPort)
+		}
+	} else {
+		// Verificar primeiras 20 portas como fallback
+		for i := 1; i <= 20; i++ {
+			portsToCheck = append(portsToCheck, BASE_PROXY_PORT+i)
+		}
+	}
+
+	// Verificar cada porta em paralelo
+	for _, port := range portsToCheck {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+
+			// Verificar se processo está rodando
+			pidFile := fmt.Sprintf("/var/run/3proxy_%d.pid", p)
+			pidData, err := ioutil.ReadFile(pidFile)
+
+			if err != nil {
+				return // PID file não existe
+			}
+
+			pid := strings.TrimSpace(string(pidData))
+			if pid == "" {
+				return
+			}
+
+			// Verificar se processo está realmente rodando
+			if _, err := os.Stat(fmt.Sprintf("/proc/%s", pid)); os.IsNotExist(err) {
+				return // Processo não está rodando
+			}
+
+			// Obter IP público (com cache)
+			publicIP := getPublicIPCached(p)
+
+			proxy := ProxyInfo{
+				Port:     p,
+				PublicIP: publicIP,
+				Protocol: "HTTP",
+				Modem:    fmt.Sprintf("Modem %d", p-BASE_PROXY_PORT),
+				Running:  true,
+			}
+
+			mutex.Lock()
+			proxies = append(proxies, proxy)
+			mutex.Unlock()
+		}(port)
+	}
+
+	wg.Wait()
+
+	return proxies
+}
+
+func getPublicIPCached(port int) string {
+	// Verificar cache
+	publicIPCacheMutex.RLock()
+	if cachedIP, ok := publicIPCache[port]; ok {
+		if cacheTime, ok := publicIPCacheTime[port]; ok {
+			if time.Since(cacheTime) < publicIPCacheTTL {
+				publicIPCacheMutex.RUnlock()
+				return cachedIP
+			}
+		}
+	}
+	publicIPCacheMutex.RUnlock()
+
+	// Obter novo IP
+	ip := getPublicIP(port)
+
+	// Atualizar cache
+	publicIPCacheMutex.Lock()
+	publicIPCache[port] = ip
+	publicIPCacheTime[port] = time.Now()
+	publicIPCacheMutex.Unlock()
+
+	return ip
+}
+
+func getPublicIP(port int) string {
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	client := &http.Client{
+		Timeout: IP_CHECK_TIMEOUT,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
+		},
+	}
+
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		return "N/A"
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 256)
+	n, err := resp.Body.Read(buf)
+	if err != nil && n == 0 {
+		return "N/A"
+	}
+
+	return strings.TrimSpace(string(buf[:n]))
+}
+
+func mustParseURL(rawURL string) *url.URL {
+	u, _ := url.Parse(rawURL)
+	return u
+}
+
+// ============================================================================
+// OBTER INFO DO SISTEMA
+// ============================================================================
+
+func getSystemInfo() SystemInfo {
+	info := SystemInfo{
+		ProxiesRunning: 0,
+		ModemCount:     0,
+	}
+
+	// Contar proxies rodando
+	files, err := ioutil.ReadDir("/var/run")
+	if err == nil {
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), "3proxy_") && strings.HasSuffix(f.Name(), ".pid") {
+				pidFile := fmt.Sprintf("/var/run/%s", f.Name())
+				pidData, err := ioutil.ReadFile(pidFile)
+				if err == nil {
+					pid := strings.TrimSpace(string(pidData))
+					if _, err := os.Stat(fmt.Sprintf("/proc/%s", pid)); err == nil {
+						info.ProxiesRunning++
+					}
+				}
+			}
+		}
+	}
+
+	// Contar modems
+	output, _ := runCommand("mmcli", "-L")
+	info.ModemCount = strings.Count(output, "Modem/")
+
+	// Uptime
+	output, _ = runCommand("uptime", "-p")
+	info.Uptime = strings.TrimSpace(output)
+
+	// Última atualização do status file
+	if stat, err := os.Stat(STATUS_FILE); err == nil {
+		info.LastUpdate = stat.ModTime().Format("2006-01-02 15:04:05")
+	}
+
+	return info
+}
+
+func loadSavedStatus() *SavedStatus {
+	data, err := ioutil.ReadFile(STATUS_FILE)
+	if err != nil {
+		return nil
+	}
+
+	var status SavedStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil
+	}
+
+	return &status
+}
+
+// ============================================================================
+// DASHBOARD HTML
+// ============================================================================
+
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	html := `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Manager Dashboard</title>
+    <title>Proxy Manager Dashboard v2.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @keyframes pulse-green {
@@ -126,6 +641,11 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         .card-hover:hover {
             transform: translateY(-4px);
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        .proxy-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1rem;
         }
     </style>
 </head>
@@ -141,8 +661,8 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                         </svg>
                     </div>
                     <div>
-                        <h1 class="text-2xl font-bold">Proxy Manager</h1>
-                        <p class="text-sm text-gray-400">Sistema Multi-Modem 4G</p>
+                        <h1 class="text-2xl font-bold">Proxy Manager v2.0</h1>
+                        <p class="text-sm text-gray-400">Sistema Multi-Modem (Até 100 modems)</p>
                     </div>
                 </div>
                 <div class="flex items-center space-x-4">
@@ -208,13 +728,15 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         </div>
 
         <div class="bg-gray-800 rounded-xl p-6 border border-gray-700 mb-8">
-            <h2 class="text-xl font-bold mb-6 flex items-center">
-                <svg class="w-6 h-6 mr-2 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path>
-                </svg>
-                Proxies HTTP
-            </h2>
-            <div id="proxies-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-bold flex items-center">
+                    <svg class="w-6 h-6 mr-2 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path>
+                    </svg>
+                    Proxies HTTP/SOCKS5
+                </h2>
+            </div>
+            <div id="proxies-container" class="proxy-grid">
                 <div class="text-center text-gray-400 py-8">Carregando...</div>
             </div>
         </div>
@@ -235,11 +757,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
     <div id="toast" class="fixed bottom-4 right-4 bg-gray-800 border border-gray-700 rounded-lg shadow-2xl p-4 transform translate-y-32 transition-transform duration-300 max-w-sm">
         <div class="flex items-start">
-            <div id="toast-icon" class="flex-shrink-0">
-                <svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                </svg>
-            </div>
+            <div id="toast-icon" class="flex-shrink-0"></div>
             <div class="ml-3 flex-1">
                 <p id="toast-message" class="text-sm font-medium text-white"></p>
             </div>
@@ -257,13 +775,13 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
             
             toastMessage.textContent = message;
             
-            if (type === 'success') {
-                toastIcon.innerHTML = '<svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
-            } else if (type === 'error') {
-                toastIcon.innerHTML = '<svg class="w-6 h-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
-            } else if (type === 'info') {
-                toastIcon.innerHTML = '<svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
-            }
+            const icons = {
+                success: '<svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>',
+                error: '<svg class="w-6 h-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>',
+                info: '<svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+            };
+            
+            toastIcon.innerHTML = icons[type] || icons.success;
             
             toast.style.transform = 'translateY(0)';
             setTimeout(function() {
@@ -278,6 +796,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                 
                 if (data.success) {
                     updateDashboard(data.data);
+                    document.getElementById('status-indicator').className = 'w-3 h-3 bg-green-500 rounded-full pulse-green';
                 }
             } catch (error) {
                 console.error('Erro ao buscar status:', error);
@@ -295,11 +814,12 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                 proxiesContainer.innerHTML = '<div class="text-center text-gray-400 py-8 col-span-full">Nenhum proxy ativo</div>';
             } else {
                 proxiesContainer.innerHTML = data.proxies.map(function(proxy) {
+                    const socksPort = proxy.port + 1000;
                     return '<div class="bg-gray-700 rounded-lg p-4 border border-gray-600 hover:border-blue-500 transition-all duration-200">' +
                         '<div class="flex justify-between items-start mb-3">' +
                         '<div>' +
-                        '<p class="text-sm text-gray-400">Porta ' + proxy.port + '</p>' +
-                        '<p class="text-lg font-bold text-blue-400">' + proxy.public_ip + '</p>' +
+                        '<p class="text-xs text-gray-400">HTTP: ' + proxy.port + ' | SOCKS5: ' + socksPort + '</p>' +
+                        '<p class="text-lg font-bold text-blue-400 mt-1">' + proxy.public_ip + '</p>' +
                         '</div>' +
                         '<span class="bg-green-500 text-xs px-2 py-1 rounded-full font-medium">Online</span>' +
                         '</div>' +
@@ -318,9 +838,9 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                 modemsContainer.innerHTML = '<div class="text-center text-gray-400 py-8">Nenhum modem detectado</div>';
             } else {
                 modemsContainer.innerHTML = data.modems.map(function(modem) {
-                    var signalColor = getSignalColor(modem.signal);
-                    var stateColor = modem.state === 'connected' ? 'bg-green-500' : 'bg-gray-500';
-                    var stateIconColor = modem.state === 'connected' ? 'text-green-400' : 'text-gray-400';
+                    const signalColor = getSignalColor(modem.signal);
+                    const stateColor = modem.state.includes('connected') ? 'bg-green-500' : 'bg-gray-500';
+                    const stateIconColor = modem.state.includes('connected') ? 'text-green-400' : 'text-gray-400';
                     
                     return '<div class="bg-gray-700 rounded-lg p-4 border border-gray-600">' +
                         '<div class="flex items-center justify-between">' +
@@ -354,8 +874,8 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         }
 
         function getSignalColor(signal) {
-            if (!signal) return 'text-gray-400';
-            var value = parseInt(signal);
+            if (!signal || signal === 'N/A') return 'text-gray-400';
+            const value = parseInt(signal);
             if (value >= 70) return 'text-green-400';
             if (value >= 50) return 'text-yellow-400';
             return 'text-red-400';
@@ -438,363 +958,12 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(html))
 }
 
-// Health check
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, Response{
-		Success: true,
-		Message: "API Proxy Manager está online",
-		Data: map[string]string{
-			"version": "1.0.0",
-			"status":  "healthy",
-		},
-	})
-}
-
-// Restart do sistema
-func restartHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondJSON(w, http.StatusMethodNotAllowed, Response{
-			Success: false,
-			Message: "Método não permitido. Use POST",
-		})
-		return
-	}
-
-	log.Println("Recebida requisição de restart")
-
-	// Executar restart em goroutine
-	go func() {
-		output, err := runCommand("sudo", SCRIPT_PATH, "restart")
-		if err != nil {
-			log.Printf("Erro ao reiniciar: %v\nOutput: %s", err, output)
-		} else {
-			log.Println("Sistema reiniciado com sucesso")
-		}
-	}()
-
-	respondJSON(w, http.StatusOK, Response{
-		Success: true,
-		Message: "Comando de restart enviado. Sistema será reiniciado em alguns segundos.",
-	})
-}
-
-// Renovar IP de porta específica
-func renewPortHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondJSON(w, http.StatusMethodNotAllowed, Response{
-			Success: false,
-			Message: "Método não permitido. Use POST",
-		})
-		return
-	}
-
-	var req RenewRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondJSON(w, http.StatusBadRequest, Response{
-			Success: false,
-			Message: "JSON inválido: " + err.Error(),
-		})
-		return
-	}
-
-	if req.Port < 6001 || req.Port > 6010 {
-		respondJSON(w, http.StatusBadRequest, Response{
-			Success: false,
-			Message: "Porta inválida. Use portas entre 6001 e 6010",
-		})
-		return
-	}
-
-	log.Printf("Renovando IP da porta %d", req.Port)
-
-	// RESPONDER IMEDIATAMENTE
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-
-	response := Response{
-		Success: true,
-		Message: "Renovação de IP iniciada. Aguarde ~45 segundos para conclusão.",
-		Data:    map[string]int{"port": req.Port},
-	}
-
-	json.NewEncoder(w).Encode(response)
-
-	// FORÇAR ENVIO IMEDIATO DA RESPOSTA
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	// EXECUTAR EM BACKGROUND (após resposta enviada)
-	go func(port int) {
-		log.Printf("Iniciando renovação da porta %d em background", port)
-		output, err := runCommand("sudo", SCRIPT_PATH, "renew-port", strconv.Itoa(port))
-
-		if err != nil {
-			log.Printf("❌ Erro ao renovar porta %d: %v", port, err)
-			log.Printf("Output: %s", output)
-		} else {
-			if strings.Contains(output, "IP RENOVADO COM SUCESSO") {
-				log.Printf("✅ Porta %d renovada com sucesso", port)
-			} else {
-				log.Printf("⚠️  Porta %d: renovação concluída mas pode não ter mudado IP", port)
-			}
-		}
-		log.Printf("Renovação da porta %d finalizada", port)
-	}(req.Port)
-}
-
-// Status do sistema
-func statusHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		respondJSON(w, http.StatusMethodNotAllowed, Response{
-			Success: false,
-			Message: "Método não permitido. Use GET",
-		})
-		return
-	}
-
-	log.Println("Consultando status")
-
-	modems := getModemStatus()
-	proxies := getProxyStatus()
-	system := getSystemInfo()
-
-	respondJSON(w, http.StatusOK, Response{
-		Success: true,
-		Message: "Status obtido com sucesso",
-		Data: StatusResponse{
-			Modems:  modems,
-			Proxies: proxies,
-			System:  system,
-		},
-	})
-}
-
-// Obter status dos modems
-func getModemStatus() []ModemInfo {
-	output, err := runCommand("mmcli", "-L")
-	if err != nil {
-		log.Printf("Erro ao listar modems: %v", err)
-		return []ModemInfo{}
-	}
-
-	var modems []ModemInfo
-	lines := strings.Split(output, "\n")
-
-	for _, line := range lines {
-		if !strings.Contains(line, "Modem/") {
-			continue
-		}
-
-		modemIdx := strings.Index(line, "Modem/")
-		if modemIdx == -1 {
-			continue
-		}
-
-		afterModem := line[modemIdx+6:]
-		var idStr string
-		for _, ch := range afterModem {
-			if ch >= '0' && ch <= '9' {
-				idStr += string(ch)
-			} else {
-				break
-			}
-		}
-
-		if idStr == "" {
-			continue
-		}
-
-		details, err := runCommand("mmcli", "-m", idStr)
-		if err != nil {
-			log.Printf("Erro ao obter detalhes do modem %s: %v", idStr, err)
-			continue
-		}
-
-		modem := ModemInfo{
-			ID:         idStr,
-			State:      "unknown",
-			Signal:     "N/A",
-			Interface:  "N/A",
-			InternalIP: "N/A",
-		}
-
-		// Parse do estado e sinal do modem
-		for _, detailLine := range strings.Split(details, "\n") {
-			trimmed := strings.TrimSpace(detailLine)
-
-			// State: procurar por "state:" seguido do valor
-			if strings.Contains(trimmed, "state:") && strings.Contains(trimmed, "|") {
-				parts := strings.Split(trimmed, "|")
-				if len(parts) >= 2 {
-					statePart := strings.TrimSpace(parts[1])
-					if strings.HasPrefix(statePart, "state:") {
-						stateValue := strings.TrimSpace(strings.TrimPrefix(statePart, "state:"))
-						modem.State = stateValue
-					}
-				}
-			}
-
-			// Signal quality: procurar por "signal quality:" e extrair percentual
-			if strings.Contains(trimmed, "signal quality:") && strings.Contains(trimmed, "|") {
-				parts := strings.Split(trimmed, "|")
-				if len(parts) >= 2 {
-					signalPart := strings.TrimSpace(parts[1])
-					if strings.HasPrefix(signalPart, "signal quality:") {
-						signalValue := strings.TrimSpace(strings.TrimPrefix(signalPart, "signal quality:"))
-						// Extrair apenas o número e % (ex: "70% (recent)" -> "70%")
-						if idx := strings.Index(signalValue, "%"); idx != -1 {
-							modem.Signal = strings.TrimSpace(signalValue[:idx+1])
-						}
-					}
-				}
-			}
-		}
-
-		// Parse do bearer para pegar interface e IP
-		if strings.Contains(details, "Bearer") {
-			bearerLine := ""
-			for _, l := range strings.Split(details, "\n") {
-				if strings.Contains(l, "Bearer") && strings.Contains(l, "paths:") {
-					bearerLine = l
-					break
-				}
-			}
-
-			if bearerLine != "" {
-				// Extrair Bearer ID (último elemento após /)
-				parts := strings.Split(bearerLine, "/")
-				if len(parts) > 0 {
-					bearerID := strings.TrimSpace(parts[len(parts)-1])
-
-					bearerInfo, err := runCommand("mmcli", "-b", bearerID)
-					if err == nil {
-						for _, bLine := range strings.Split(bearerInfo, "\n") {
-							trimmed := strings.TrimSpace(bLine)
-
-							// Interface: procurar "interface:" na linha
-							if strings.Contains(trimmed, "interface:") && strings.Contains(trimmed, "|") {
-								parts := strings.Split(trimmed, "|")
-								if len(parts) >= 2 {
-									ifacePart := strings.TrimSpace(parts[1])
-									if strings.HasPrefix(ifacePart, "interface:") {
-										modem.Interface = strings.TrimSpace(strings.TrimPrefix(ifacePart, "interface:"))
-									}
-								}
-							}
-
-							// Address: procurar "address:" na linha
-							if strings.Contains(trimmed, "address:") && strings.Contains(trimmed, "|") {
-								parts := strings.Split(trimmed, "|")
-								if len(parts) >= 2 {
-									addrPart := strings.TrimSpace(parts[1])
-									if strings.HasPrefix(addrPart, "address:") {
-										modem.InternalIP = strings.TrimSpace(strings.TrimPrefix(addrPart, "address:"))
-									}
-								}
-							}
-						}
-					} else {
-						log.Printf("Erro ao obter bearer %s do modem %s: %v", bearerID, idStr, err)
-					}
-				}
-			}
-		}
-
-		log.Printf("Modem adicionado: ID=%s, Interface=%s, IP=%s, State=%s, Signal=%s",
-			modem.ID, modem.Interface, modem.InternalIP, modem.State, modem.Signal)
-
-		modems = append(modems, modem)
-	}
-
-	log.Printf("Total de modems encontrados: %d", len(modems))
-
-	if modems == nil {
-		return []ModemInfo{}
-	}
-
-	return modems
-}
-
-// Obter status dos proxies
-func getProxyStatus() []ProxyInfo {
-	var proxies []ProxyInfo
-
-	for port := 6001; port <= 6010; port++ {
-		output, err := runCommand("netstat", "-tlnp")
-		if err != nil || !strings.Contains(output, fmt.Sprintf(":%d ", port)) {
-			continue
-		}
-
-		publicIP := getPublicIP(port)
-
-		proxies = append(proxies, ProxyInfo{
-			Port:     port,
-			PublicIP: publicIP,
-			Protocol: "HTTP",
-			Modem:    fmt.Sprintf("Modem %d", port-6000),
-		})
-	}
-
-	return proxies
-}
-
-// Obter IP público através de proxy
-func getPublicIP(port int) string {
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-
-	client := &http.Client{
-		Timeout: 5 * time.Second, // Reduzido de 10 para 5 segundos
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
-		},
-	}
-
-	resp, err := client.Get("https://api.ipify.org")
-	if err != nil {
-		log.Printf("Erro ao obter IP público da porta %d: %v", port, err)
-		return "N/A"
-	}
-	defer resp.Body.Close()
-
-	buf := make([]byte, 256)
-	n, err := resp.Body.Read(buf)
-	if err != nil && n == 0 {
-		return "N/A"
-	}
-
-	return strings.TrimSpace(string(buf[:n]))
-}
-
-func mustParseURL(rawURL string) *url.URL {
-	u, _ := url.Parse(rawURL)
-	return u
-}
-
-// Obter info do sistema
-func getSystemInfo() SystemInfo {
-	info := SystemInfo{
-		Proxy3Running: false,
-		ModemCount:    0,
-	}
-
-	// Verificar se 3proxy está rodando
-	output, _ := runCommand("pgrep", "3proxy")
-	info.Proxy3Running = len(strings.TrimSpace(output)) > 0
-
-	// Contar modems
-	output, _ = runCommand("mmcli", "-L")
-	info.ModemCount = strings.Count(output, "Modem/")
-
-	// Uptime
-	output, _ = runCommand("uptime", "-p")
-	info.Uptime = strings.TrimSpace(output)
-
-	return info
-}
+// ============================================================================
+// MAIN
+// ============================================================================
 
 func main() {
-	// Verificar se o script existe
+	// Verificar script
 	if _, err := os.Stat(SCRIPT_PATH); os.IsNotExist(err) {
 		log.Fatalf("❌ Script não encontrado: %s", SCRIPT_PATH)
 	}
@@ -807,7 +976,8 @@ func main() {
 	http.HandleFunc("/status", corsMiddleware(loggingMiddleware(statusHandler)))
 
 	log.Println("========================================")
-	log.Printf("🚀 API Proxy Manager v1.0.0")
+	log.Printf("🚀 API Proxy Manager v2.0.0")
+	log.Printf("📱 Suporte: até %d modems", MAX_MODEMS)
 	log.Printf("🌐 Dashboard: http://0.0.0.0%s", PORT)
 	log.Println("========================================")
 	log.Println("📋 Endpoints disponíveis:")
@@ -816,6 +986,9 @@ func main() {
 	log.Println("  GET  /status   - Status JSON")
 	log.Println("  POST /restart  - Reiniciar sistema")
 	log.Println("  POST /renew    - Renovar IP de porta")
+	log.Println("========================================")
+	log.Printf("🔌 Portas HTTP: %d-%d", BASE_PROXY_PORT+1, BASE_PROXY_PORT+MAX_MODEMS)
+	log.Printf("🔌 Portas SOCKS5: %d-%d", BASE_SOCKS_PORT+1, BASE_SOCKS_PORT+MAX_MODEMS)
 	log.Println("========================================")
 
 	if err := http.ListenAndServe(PORT, nil); err != nil {
